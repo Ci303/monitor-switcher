@@ -1,0 +1,64 @@
+name: Build Release Zip
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package for
+        required: false
+        type: string
+
+jobs:
+  build-release-zip:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Determine version label
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "release") {
+            $tag = "${{ github.event.release.tag_name }}"
+          } elseif ("${{ inputs.tag }}") {
+            $tag = "${{ inputs.tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish app
+        shell: pwsh
+        run: |
+          dotnet publish .\MonitorSwitcher\MonitorSwitcher.csproj -c Release -o .\artifacts\publish
+
+      - name: Create zip package
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zipName = "MonitorSwitcher-$tag-win-x64.zip"
+          if (Test-Path ".\artifacts\$zipName") {
+            Remove-Item ".\artifacts\$zipName" -Force
+          }
+          Compress-Archive -Path .\artifacts\publish\* -DestinationPath ".\artifacts\$zipName"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-switcher-release-zip
+          path: .\artifacts\MonitorSwitcher-${{ steps.version.outputs.tag }}-win-x64.zip
+
+      - name: Attach zip to GitHub release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: .\artifacts\MonitorSwitcher-${{ steps.version.outputs.tag }}-win-x64.zip

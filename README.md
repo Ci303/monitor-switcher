@@ -37,6 +37,12 @@ dotnet run --project .\MonitorSwitcher\MonitorSwitcher.csproj
 
 If you want the monitor actions to work during local development, copy the NirSoft files into `MonitorSwitcher\bin\Debug\net8.0-windows\` after build, or place them in the project directory before building so MSBuild copies them to the output folder.
 
+## Releases
+
+GitHub releases are packaged as a zip archive of the published app output. There is currently no installer; download the release zip, extract it to a folder, and run `MonitorSwitcher.exe`.
+
+If you want full monitor control features after extracting a release, place `MultiMonitorTool.exe` and `MultiMonitorTool.cfg` beside `MonitorSwitcher.exe`.
+
 ## Layout Storage
 
 The monitor layout snapshot is stored per user under:
