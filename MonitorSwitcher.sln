@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.13.35931.197
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MonitorSwitcher", "MonitorSwitcher\MonitorSwitcher.csproj", "{A2F9D2BF-75E8-4AB4-8F58-DCBE1065EAA9}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A2F9D2BF-75E8-4AB4-8F58-DCBE1065EAA9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A2F9D2BF-75E8-4AB4-8F58-DCBE1065EAA9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A2F9D2BF-75E8-4AB4-8F58-DCBE1065EAA9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A2F9D2BF-75E8-4AB4-8F58-DCBE1065EAA9}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {8B637F94-F7DB-4AA5-81DC-78BEDF5F3897}
+	EndGlobalSection
+EndGlobal

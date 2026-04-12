@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net8.0-windows</TargetFramework>
+		<UseWindowsForms>true</UseWindowsForms>
+		<Nullable>enable</Nullable>
+		<ApplicationIcon>MonitorSwitcher_transparent.ico</ApplicationIcon>
+
+	</PropertyGroup>
+
+	<ItemGroup>
+	  <None Remove="MonitorSwitcher_transparent.ico" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <Content Include="monitor-layout.cfg" Condition="Exists('monitor-layout.cfg')">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	    <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+	  </Content>
+	  <Content Include="MultiMonitorTool.cfg" Condition="Exists('MultiMonitorTool.cfg')">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	    <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+	  </Content>
+	  <Content Include="MultiMonitorTool.exe" Condition="Exists('MultiMonitorTool.exe')">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	    <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+	  </Content>
+	</ItemGroup>
+
+	<ItemGroup>
+	  <EmbeddedResource Update="Form1.resx">
+	    <DependentUpon>Form1.cs</DependentUpon>
+	  </EmbeddedResource>
+	</ItemGroup>
+
+	<ItemGroup>
+	  <Content Include="MonitorSwitcher_transparent.ico">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	    <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+	  </Content>
+	</ItemGroup>
+
+</Project>
