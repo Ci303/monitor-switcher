@@ -407,7 +407,7 @@ namespace WorkMonitorSwitcher
                 })
                 .ToList();
 
-            using var dlg = new AliasSettingsForm(rows, _uiSettings.DarkMode, _uiSettings.AlwaysOnTop)
+            using var dlg = new AliasSettingsForm(rows, _uiSettings.DarkMode, _uiSettings.AlwaysOnTop, Path.Combine(AppContext.BaseDirectory, "MultiMonitorTool.cfg"))
             {
                 StartPosition = FormStartPosition.CenterParent,
                 ShowInTaskbar = false,
@@ -432,6 +432,9 @@ namespace WorkMonitorSwitcher
 
             if (dr == DialogResult.OK)
             {
+                foreach (var removedKey in dlg.RemovedKeys)
+                    _aliasMap.Remove(removedKey);
+
                 // Aliases
                 foreach (var kvp in dlg.UpdatedMappings)
                 {
