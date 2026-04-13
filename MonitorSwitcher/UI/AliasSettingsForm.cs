@@ -339,7 +339,8 @@ namespace WorkMonitorSwitcher
 
                 MessageBox.Show(
                     this,
-                    $"MultiMonitorTool.exe downloaded successfully to:\n{exePath}",
+                    $"MultiMonitorTool.exe downloaded successfully to:\n{exePath}\n\n" +
+                    "Keep MultiMonitorTool.cfg in the same folder as MultiMonitorTool.exe and MonitorSwitcher.exe.",
                     "Download MultiMonitorTool",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
