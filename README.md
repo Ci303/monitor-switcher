@@ -17,7 +17,8 @@ Windows Forms utility for switching work monitor profiles with NirSoft `MultiMon
 
 ## Third-Party Tool Setup
 
-Download `MultiMonitorTool` from the official NirSoft page and place these files beside the built app executable. There is a download button within the settings menu of this app:
+Download `MultiMonitorTool` from the official NirSoft page and place these files beside the built app executable.
+There is a download button within the settings menu of this app:
 
 - `MultiMonitorTool.exe`
 - `MultiMonitorTool.cfg`
