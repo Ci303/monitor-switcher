@@ -1,5 +1,8 @@
 name: Build Release Zip
 
+permissions:
+  contents: write
+
 on:
   release:
     types: [published]
@@ -58,7 +61,8 @@ jobs:
           path: .\artifacts\MonitorSwitcher-${{ steps.version.outputs.tag }}-win-x64.zip
 
       - name: Attach zip to GitHub release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || steps.version.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
           files: .\artifacts\MonitorSwitcher-${{ steps.version.outputs.tag }}-win-x64.zip
