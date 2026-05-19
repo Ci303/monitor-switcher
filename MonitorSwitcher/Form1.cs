@@ -291,6 +291,12 @@ namespace WorkMonitorSwitcher
             const int WM_DEVICECHANGE = 0x0219;
             const int WM_SETTINGCHANGE = 0x001A;
 
+            if (m.Msg == SingleInstanceMessenger.ShowExistingWindowMessage)
+            {
+                ShowMainWindowForInteraction();
+                return;
+            }
+
             if (m.Msg == WM_DISPLAYCHANGE || m.Msg == WM_DEVICECHANGE || m.Msg == WM_SETTINGCHANGE)
             {
                 _refreshTimer.Stop();

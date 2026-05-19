@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.3.1 - 2026-05-19
+
+### Added
+
+- Added single-instance startup behavior so launching Monitor Switcher again restores the existing window instead of opening a second copy.
+
 ## v0.3.0 - 2026-05-19
 
 ### Added
