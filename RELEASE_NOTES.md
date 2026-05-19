@@ -19,6 +19,7 @@
 - Settings now shows shortened registry class paths in the grid while preserving full registry keys for tooltips, copying, details, and Regedit opening.
 - Layout profile names are sanitized before storage to avoid invalid filename characters and profile-file collisions.
 - Missing `MultiMonitorTool.exe` is reported in the main-window banner and diagnostics log instead of interrupting every startup with a modal warning.
+- Stale saved `DEV:` display aliases are now merged into the current stable monitor entries instead of appearing as duplicate offline monitors.
 - Release zips are now self-contained Windows x64 packages.
 - Release workflow now has the permissions needed to attach generated release zips.
 - Manual release workflow runs only attach assets to a GitHub release when a tag is supplied.
