@@ -31,6 +31,8 @@ namespace WorkMonitorSwitcher
         // Stores (JSON) and services
         private readonly UiSettingsStore _uiStore;
         private readonly AliasStore _aliasStore;
+        private readonly LayoutProfileStore _profileStore;
+        private readonly DiagnosticsLog _log;
         private readonly DetectionService _detectSvc;
         private readonly LayoutService _layoutSvc;
 
@@ -58,14 +60,22 @@ namespace WorkMonitorSwitcher
         private Button? _btnSettings;
         private Button? _btnRefresh;
         private Button? _btnSaveLayout;
+        private Button? _btnRestoreLayout;
         private Label? _summaryLabel;
         private Panel? _hrTop;
+        private Panel? _missingToolPanel;
+        private Label? _missingToolLabel;
+        private Button? _missingToolSettingsButton;
+        private NotifyIcon? _trayIcon;
+        private ContextMenuStrip? _trayMenu;
         private readonly ToolTip _toolTip = new() { InitialDelay = 350, ReshowDelay = 100, AutoPopDelay = 8000 };
 
         private int _layoutRightMost;
 
         // Tracks rows currently executing a tool command
         private readonly HashSet<string> _busy = new(StringComparer.OrdinalIgnoreCase);
+        private bool _exitRequested;
+        private bool _restoringFromTray;
 
         // Restore robustness
         private bool _deferredLayout; // schedule a full rebuild after restore/show
@@ -97,7 +107,7 @@ namespace WorkMonitorSwitcher
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
-            MinimumSize = new Size(440, 280); // avoids restore-to-titlebar
+            MinimumSize = new Size(420, 260); // avoids restore-to-titlebar
 
             Directory.CreateDirectory(_appDataDir);
             _layoutPath = Path.Combine(_appDataDir, "monitor-layout.cfg");
@@ -105,10 +115,24 @@ namespace WorkMonitorSwitcher
 
             _uiStore = new UiSettingsStore(_appDataDir);
             _aliasStore = new AliasStore(_appDataDir);
+            _profileStore = new LayoutProfileStore(_appDataDir, _layoutPath);
+            _log = new DiagnosticsLog(_appDataDir);
             _detectSvc = new DetectionService(_toolPath);
             _layoutSvc = new LayoutService(_toolPath);
 
             _uiSettings = _uiStore.LoadOrDefault();
+            var startupEnabled = StartupManager.IsEnabled();
+            if (_uiSettings.StartWithWindows && !startupEnabled)
+            {
+                StartupManager.SetEnabled(true, Application.ExecutablePath);
+                startupEnabled = StartupManager.IsEnabled();
+            }
+
+            if (_uiSettings.StartWithWindows != startupEnabled)
+            {
+                _uiSettings.StartWithWindows = startupEnabled;
+                _uiStore.Save(_uiSettings);
+            }
             var aliases = _aliasStore.Load();
             foreach (var kv in aliases) _aliasMap[kv.Key] = kv.Value;
 
@@ -123,27 +147,43 @@ namespace WorkMonitorSwitcher
             Controls.Add(_btnRefresh);
             _toolTip.SetToolTip(_btnRefresh, "Detect monitors again.");
 
-            _btnSaveLayout = new Button { Text = "Save Layout", Size = new Size(106, 32) };
-            _btnSaveLayout.Click += (_, __) =>
-            {
-                var ok = _layoutSvc.SaveLayout(_layoutPath);
-                if (!ok)
-                    ThemedMessageBox.Info(this,
-                        "Unable to save layout. Is MultiMonitorTool.exe present?",
-                        "Save Layout", _uiSettings.DarkMode);
-                else
-                    ThemedMessageBox.Info(this, "Layout saved.", "Save Layout", _uiSettings.DarkMode);
-            };
+            _btnSaveLayout = new Button { Text = "Save", Size = new Size(74, 32) };
+            _btnSaveLayout.Click += (_, __) => SaveSelectedLayoutProfile();
             Controls.Add(_btnSaveLayout);
-            _toolTip.SetToolTip(_btnSaveLayout, "Save the current monitor layout for automatic restore.");
+            _toolTip.SetToolTip(_btnSaveLayout, "Save the current monitor layout to a named profile.");
+
+            _btnRestoreLayout = new Button { Text = "Restore", Size = new Size(82, 32) };
+            _btnRestoreLayout.Click += async (_, __) => await RestoreSelectedLayoutProfileAsync(showMessage: true);
+            Controls.Add(_btnRestoreLayout);
+            _toolTip.SetToolTip(_btnRestoreLayout, "Restore the selected saved monitor layout.");
 
             _summaryLabel = new Label
             {
                 AutoSize = true,
                 Text = "Detecting monitors...",
-                Font = new Font("Segoe UI", 9, FontStyle.Regular)
+                Font = new Font("Segoe UI", 8.75f, FontStyle.Regular)
             };
             Controls.Add(_summaryLabel);
+
+            _missingToolPanel = new Panel
+            {
+                Height = 36,
+                Visible = false,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            _missingToolLabel = new Label
+            {
+                AutoSize = false,
+                Text = "MultiMonitorTool is missing. Detection is limited and monitor actions are unavailable.",
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            _missingToolSettingsButton = new Button { Text = "Settings", Size = new Size(82, 26) };
+            _missingToolSettingsButton.Click += SettingsButton_Click;
+            _missingToolPanel.Controls.Add(_missingToolLabel);
+            _missingToolPanel.Controls.Add(_missingToolSettingsButton);
+            Controls.Add(_missingToolPanel);
+
+            SetupTrayIcon();
 
             _hrTop = new Panel { Height = 1, BackColor = SystemColors.ControlDark, Visible = true };
             Controls.Add(_hrTop);
@@ -151,7 +191,7 @@ namespace WorkMonitorSwitcher
             SizeChanged += (_, __) => LeftTopButtons();
             Layout += (_, __) => LeftTopButtons();
 
-            CheckToolExists(); // warning only; app still runs
+            CheckToolExists();
 
             // Apply theme and caption styling
             ApplyTheme(_uiSettings.DarkMode);
@@ -169,8 +209,15 @@ namespace WorkMonitorSwitcher
 
             RefreshMonitorsAndUi();
 
-            FormClosing += (_, __) =>
+            FormClosing += (_, e) =>
             {
+                if (!_exitRequested && _uiSettings.MinimizeToTray && e.CloseReason == CloseReason.UserClosing)
+                {
+                    e.Cancel = true;
+                    HideToTray();
+                    return;
+                }
+
                 SaveWindowBounds();
                 _uiStore.Save(_uiSettings);
             };
@@ -199,12 +246,25 @@ namespace WorkMonitorSwitcher
         {
             base.OnSizeChanged(e);
 
+            if (!_restoringFromTray && _uiSettings != null && _uiSettings.MinimizeToTray && WindowState == FormWindowState.Minimized && Visible)
+            {
+                BeginInvoke(new Action(HideToTray));
+                return;
+            }
+
             if (IsNormalVisible && _deferredLayout)
             {
                 _deferredLayout = false;
                 RefreshMonitorsAndUi();
                 LeftTopButtons();
             }
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            _trayIcon?.Dispose();
+            _trayMenu?.Dispose();
+            base.OnFormClosed(e);
         }
 
         // Composited painting for children (extra flicker reduction)
@@ -342,12 +402,12 @@ namespace WorkMonitorSwitcher
 
         private void LeftTopButtons()
         {
-            if (_btnSettings == null || _btnRefresh == null || _btnSaveLayout == null) return;
+            if (_btnSettings == null || _btnRefresh == null || _btnSaveLayout == null || _btnRestoreLayout == null) return;
 
             // Don't lay out while minimized; mark that we owe a layout later.
             if (!IsNormalVisible) { _deferredLayout = true; return; }
 
-            const int spacing = 12;
+            const int spacing = 18;
             int x = SideMargin;
 
             _btnSettings.Location = new Point(x, TopButtonsY);
@@ -359,19 +419,22 @@ namespace WorkMonitorSwitcher
             _btnSaveLayout.Location = new Point(x, TopButtonsY);
             x = _btnSaveLayout.Right + spacing;
 
-            if (_summaryLabel != null)
-            {
-                var summarySize = _summaryLabel.PreferredSize;
-                int summaryX = Math.Max(x, ClientSize.Width - SideMargin - summarySize.Width);
-                _summaryLabel.Location = new Point(summaryX, TopButtonsY + Math.Max(0, (_btnSaveLayout.Height - summarySize.Height) / 2));
-            }
+            _btnRestoreLayout.Location = new Point(x, TopButtonsY);
+            x = _btnRestoreLayout.Right + spacing;
 
             _btnSettings.BringToFront();
             _btnRefresh.BringToFront();
             _btnSaveLayout.BringToFront();
-            _summaryLabel?.BringToFront();
+            _btnRestoreLayout.BringToFront();
 
             UpdateTopSeparator();
+        }
+
+        private int GetCompactClientWidth()
+        {
+            int contentRight = SideMargin + RowPanelWidth;
+            int toolbarRight = (_btnRestoreLayout?.Right ?? _btnSaveLayout?.Right ?? 0);
+            return Math.Max(contentRight + SideMargin, toolbarRight + SideMargin);
         }
 
         private int GetSeparatorY()
@@ -388,6 +451,229 @@ namespace WorkMonitorSwitcher
             _hrTop.Width = Math.Max(0, ClientSize.Width - (SideMargin * 2));
             _hrTop.Height = 1;
             // color is updated by ApplyTheme
+
+            UpdateMissingToolPanel();
+        }
+
+        private void UpdateMissingToolPanel()
+        {
+            if (_missingToolPanel == null || _missingToolLabel == null || _missingToolSettingsButton == null)
+                return;
+
+            bool missing = !File.Exists(_toolPath);
+            _missingToolPanel.Visible = missing;
+            if (!missing) return;
+
+            int y = GetSeparatorY() + 8;
+            _missingToolPanel.Location = new Point(SideMargin, y);
+            _missingToolPanel.Width = Math.Max(0, ClientSize.Width - (SideMargin * 2));
+
+            _missingToolSettingsButton.Location = new Point(_missingToolPanel.Width - _missingToolSettingsButton.Width - 6, 4);
+            _missingToolLabel.Location = new Point(10, 5);
+            _missingToolLabel.Size = new Size(Math.Max(0, _missingToolSettingsButton.Left - 18), 24);
+            _missingToolPanel.BringToFront();
+        }
+
+        private int GetRowsStartY()
+        {
+            int sepY = GetSeparatorY();
+            int yStart = sepY + (_hrTop?.Height ?? 1) + 12;
+            if (_missingToolPanel?.Visible == true)
+                yStart = _missingToolPanel.Bottom + 12;
+            return Math.Max(FirstRowY, yStart);
+        }
+
+        private void SetupTrayIcon()
+        {
+            _trayMenu = new ContextMenuStrip();
+            _trayMenu.Items.Add("Open Monitor Switcher", null, (_, __) => RestoreFromTray());
+            _trayMenu.Items.Add("Refresh", null, (_, __) => RefreshMonitorsAndUi());
+            _trayMenu.Items.Add("Save Layout", null, (_, __) =>
+            {
+                ShowMainWindowForInteraction();
+                SaveSelectedLayoutProfile();
+            });
+            _trayMenu.Items.Add("Restore Layout", null, async (_, __) => await RestoreSelectedLayoutProfileAsync(showMessage: false));
+            _trayMenu.Items.Add("Settings", null, (sender, e) =>
+            {
+                ShowMainWindowForInteraction();
+                SettingsButton_Click(sender, e);
+            });
+            _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add("Exit", null, (_, __) =>
+            {
+                _exitRequested = true;
+                Close();
+            });
+
+            _trayIcon = new NotifyIcon
+            {
+                Text = "Monitor Switcher",
+                ContextMenuStrip = _trayMenu,
+                Visible = true
+            };
+
+            try
+            {
+                _trayIcon.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch
+            {
+                _trayIcon.Icon = SystemIcons.Application;
+            }
+
+            _trayIcon.DoubleClick += (_, __) => RestoreFromTray();
+        }
+
+        private void HideToTray()
+        {
+            SaveWindowBounds();
+            _uiStore.Save(_uiSettings);
+            ShowInTaskbar = false;
+            Hide();
+            if (_trayIcon != null)
+                _trayIcon.ShowBalloonTip(2000, "Monitor Switcher", "Still running in the notification area.", ToolTipIcon.Info);
+        }
+
+        private void ShowMainWindowForInteraction()
+        {
+            if (!Visible || WindowState == FormWindowState.Minimized || !ShowInTaskbar)
+                RestoreFromTray();
+            else
+                Activate();
+        }
+
+        private void RestoreFromTray()
+        {
+            _restoringFromTray = true;
+            ShowInTaskbar = true;
+            WindowState = FormWindowState.Normal;
+            Show();
+            Activate();
+
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        WindowState = FormWindowState.Normal;
+                        _deferredLayout = false;
+                        RefreshMonitorsAndUi();
+                        LeftTopButtons();
+                        Invalidate(true);
+                        Update();
+                    }
+                    finally
+                    {
+                        _restoringFromTray = false;
+                    }
+                }));
+            }
+            catch
+            {
+                _restoringFromTray = false;
+            }
+        }
+
+        private string SelectedLayoutProfileName()
+            => LayoutProfileStore.NormalizeProfileName(_uiSettings.SelectedLayoutProfile);
+
+        private string SelectedLayoutPath()
+            => _profileStore.GetLayoutPath(SelectedLayoutProfileName());
+
+        private void SaveSelectedLayoutProfile()
+        {
+            var profile = PromptForLayoutProfileName(SelectedLayoutProfileName());
+            if (string.IsNullOrWhiteSpace(profile))
+                return;
+
+            var path = _profileStore.GetLayoutPath(profile);
+            var ok = _layoutSvc.SaveLayout(path);
+            _log.Write(ok
+                ? $"Saved layout profile '{profile}' to {path}."
+                : $"Failed to save layout profile '{profile}'. MultiMonitorTool present: {File.Exists(_toolPath)}.");
+
+            if (!ok)
+            {
+                ThemedMessageBox.Info(this,
+                    "Unable to save layout. Is MultiMonitorTool.exe present?",
+                    "Save Layout", _uiSettings.DarkMode);
+                return;
+            }
+
+            _profileStore.AddProfileName(profile);
+            _uiSettings.SelectedLayoutProfile = profile;
+            _uiStore.Save(_uiSettings);
+            ThemedMessageBox.Info(this, $"Layout profile '{profile}' saved.", "Save Layout", _uiSettings.DarkMode);
+        }
+
+        private string? PromptForLayoutProfileName(string currentName)
+        {
+            using var dlg = new Form
+            {
+                Text = "Save Layout Profile",
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MinimizeBox = false,
+                MaximizeBox = false,
+                ShowInTaskbar = false,
+                ClientSize = new Size(360, 126)
+            };
+
+            var label = new Label
+            {
+                Text = "Profile name",
+                Location = new Point(14, 16),
+                AutoSize = true
+            };
+            var input = new TextBox
+            {
+                Text = currentName,
+                Location = new Point(14, 42),
+                Size = new Size(330, 24)
+            };
+            var ok = new Button { Text = "Save", DialogResult = DialogResult.OK, Size = new Size(82, 30), Location = new Point(172, 84) };
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(82, 30), Location = new Point(262, 84) };
+
+            dlg.Controls.Add(label);
+            dlg.Controls.Add(input);
+            dlg.Controls.Add(ok);
+            dlg.Controls.Add(cancel);
+            dlg.AcceptButton = ok;
+            dlg.CancelButton = cancel;
+            Themer.Apply(dlg, _uiSettings.DarkMode ? ThemePalette.Dark() : ThemePalette.Light());
+            DwmInterop.SetDarkTitleBar(dlg.Handle, _uiSettings.DarkMode);
+
+            input.SelectAll();
+            return dlg.ShowDialog(this) == DialogResult.OK
+                ? LayoutProfileStore.NormalizeProfileName(input.Text)
+                : null;
+        }
+
+        private async Task RestoreSelectedLayoutProfileAsync(bool showMessage)
+        {
+            var profile = SelectedLayoutProfileName();
+            var path = _profileStore.GetLayoutPath(profile);
+            var ok = _layoutSvc.LoadLayout(path);
+            _log.Write(ok
+                ? $"Restored layout profile '{profile}' from {path}."
+                : $"Failed to restore layout profile '{profile}' from {path}.");
+
+            if (!ok)
+            {
+                if (showMessage)
+                    ThemedMessageBox.Warn(this,
+                        $"Unable to restore layout profile '{profile}'. Save it first and confirm MultiMonitorTool.exe is present.",
+                        "Restore Layout", _uiSettings.DarkMode);
+                return;
+            }
+
+            await Task.Delay(800);
+            RefreshMonitorsAndUi();
+
+            if (showMessage)
+                ThemedMessageBox.Info(this, $"Layout profile '{profile}' restored.", "Restore Layout", _uiSettings.DarkMode);
         }
 
         // ---------- Theme / caption ----------
@@ -415,6 +701,9 @@ namespace WorkMonitorSwitcher
         // ---------- Settings dialog ----------
         private void SettingsButton_Click(object? sender, EventArgs e)
         {
+            if (!Visible || WindowState == FormWindowState.Minimized || !ShowInTaskbar)
+                ShowMainWindowForInteraction();
+
             var rows = BuildPresentationList()
                 .Select(d =>
                 {
@@ -427,12 +716,28 @@ namespace WorkMonitorSwitcher
                         ShortKey = d.StableKey.Length <= 28 ? d.StableKey : "…" + d.StableKey[^28..],
                         Alias = alias,
                         RegistryKey = reg,
-                        IsPreferredPrimary = (mi?.IsPreferredPrimary ?? false)
+                        IsPreferredPrimary = (mi?.IsPreferredPrimary ?? false),
+                        DeviceName = d.DeviceName,
+                        MonitorName = d.Name,
+                        MonitorId = d.MonitorId,
+                        InstanceId = d.InstanceId,
+                        SerialNumber = d.SerialNumber,
+                        KnownTargets = mi == null ? string.Empty : string.Join(", ", mi.KnownTargets)
                     };
                 })
                 .ToList();
 
-            using var dlg = new AliasSettingsForm(rows, _uiSettings.DarkMode, _uiSettings.AlwaysOnTop, Path.Combine(AppContext.BaseDirectory, "MultiMonitorTool.cfg"))
+            using var dlg = new AliasSettingsForm(
+                rows,
+                _uiSettings.DarkMode,
+                _uiSettings.AlwaysOnTop,
+                _uiSettings.MinimizeToTray,
+                _uiSettings.StartWithWindows,
+                _uiSettings.ConfirmBeforeDisable,
+                Path.Combine(AppContext.BaseDirectory, "MultiMonitorTool.cfg"),
+                _profileStore.LoadProfileNames(),
+                SelectedLayoutProfileName(),
+                _log.Read())
             {
                 StartPosition = FormStartPosition.CenterParent,
                 ShowInTaskbar = false,
@@ -494,6 +799,28 @@ namespace WorkMonitorSwitcher
                     _uiStore.Save(_uiSettings);
                     TopMost = _uiSettings.AlwaysOnTop;
                 }
+
+                if (dlg.MinimizeToTrayResult.HasValue)
+                    _uiSettings.MinimizeToTray = dlg.MinimizeToTrayResult.Value;
+
+                if (dlg.StartWithWindowsResult.HasValue)
+                {
+                    _uiSettings.StartWithWindows = dlg.StartWithWindowsResult.Value;
+                    StartupManager.SetEnabled(_uiSettings.StartWithWindows, Application.ExecutablePath);
+                }
+
+                if (dlg.ConfirmBeforeDisableResult.HasValue)
+                    _uiSettings.ConfirmBeforeDisable = dlg.ConfirmBeforeDisableResult.Value;
+
+                if (!string.IsNullOrWhiteSpace(dlg.SelectedLayoutProfileResult))
+                {
+                    _uiSettings.SelectedLayoutProfile = dlg.SelectedLayoutProfileResult;
+                }
+
+                foreach (var profile in dlg.RemovedLayoutProfiles)
+                    _profileStore.DeleteProfile(profile);
+
+                _uiStore.Save(_uiSettings);
 
                 RefreshMonitorsAndUi();
             }
@@ -583,6 +910,8 @@ namespace WorkMonitorSwitcher
                 // NEW: remember useful command targets (device + friendly name)
                 EnsureKnownTargets(m.StableKey, m.DeviceName, m.Name);
             }
+
+            RemoveShadowedDeviceAliases();
             _aliasStore.Save(_aliasMap);
 
             var toShow = BuildPresentationList();
@@ -597,23 +926,28 @@ namespace WorkMonitorSwitcher
 
                 _layoutRightMost = 0;
 
-                int sepY = GetSeparatorY();
-                int yStart = sepY + (_hrTop?.Height ?? 1) + 12;
-                int y = Math.Max(FirstRowY, yStart);
+                UpdateMissingToolPanel();
+                int y = GetRowsStartY();
 
+                int lastRowBottom = y;
                 foreach (var m in toShow)
                 {
                     AddMonitorControls(m, GetAliasFor(m.StableKey), y);
+                    lastRowBottom = y + RowPanelHeight;
                     y += RowVerticalGap;
                 }
 
-                int desiredWidth = Math.Max(RowPanelWidth + (SideMargin * 2), _layoutRightMost + SideMargin);
+                if (_summaryLabel != null)
+                {
+                    var summarySize = _summaryLabel.PreferredSize;
+                    int summaryX = SideMargin + RowPanelWidth - summarySize.Width;
+                    int summaryY = Math.Max(GetRowsStartY(), lastRowBottom + 4);
+                    _summaryLabel.Location = new Point(summaryX, summaryY);
+                    _summaryLabel.BringToFront();
+                    y = _summaryLabel.Bottom + 8;
+                }
 
-                // Also ensure there’s room for the top buttons row
-                int topButtonsRight = (_btnSaveLayout?.Right ?? 0);
-                desiredWidth = Math.Max(desiredWidth, topButtonsRight + SideMargin);
-                desiredWidth = Math.Max(desiredWidth, (_summaryLabel?.Right ?? 0) + SideMargin);
-
+                int desiredWidth = GetCompactClientWidth();
                 int desiredHeight = Math.Max(120, y + SideMargin);
 
                 if (IsNormalVisible)
@@ -836,6 +1170,19 @@ namespace WorkMonitorSwitcher
                 return;
             }
 
+            if (_uiSettings.ConfirmBeforeDisable)
+            {
+                var name = GetAliasFor(stableKey);
+                var choice = MessageBox.Show(
+                    this,
+                    $"Disable '{name}'?",
+                    "Disable Monitor",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+                if (choice != DialogResult.Yes)
+                    return;
+            }
+
             var target = ResolveDisableTargetArg(stableKey);
             if (string.IsNullOrWhiteSpace(target))
             {
@@ -846,6 +1193,7 @@ namespace WorkMonitorSwitcher
                 return;
             }
             LogMonitorAction($"DISABLE {stableKey}: selected target '{target}'.");
+            _log.Write($"Disable requested for '{GetAliasFor(stableKey)}' using target '{target}'.");
 
             // --- NEW: if this window is currently on the display we're about to disable,
             // move it to a safe, still-active screen first.
@@ -860,7 +1208,7 @@ namespace WorkMonitorSwitcher
 
             // Capture baseline layout if everything is currently active
             bool allActiveNow = _detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive);
-            if (allActiveNow) _layoutSvc.SaveLayout(_layoutPath);
+            if (allActiveNow) _layoutSvc.SaveLayout(SelectedLayoutPath());
 
             // Show WORKING… and lock the row
             SetRowBusy(stableKey, true);
@@ -868,6 +1216,7 @@ namespace WorkMonitorSwitcher
 
             var res = await ExecToolAsync("/disable", target);
             LogMonitorAction($"DISABLE {stableKey}: exit={res.ExitCode}, stderr='{res.StdErr}'.");
+            _log.Write($"Disable result for '{GetAliasFor(stableKey)}': exit={res.ExitCode}, stderr='{res.StdErr}'.");
 
             // Give the desktop a brief moment to settle
             await Task.Delay(400);
@@ -901,6 +1250,7 @@ namespace WorkMonitorSwitcher
                 return;
             }
             LogMonitorAction($"ENABLE {stableKey}: candidate targets [{string.Join(", ", enableTargets.Select(t => $"'{t}'"))}].");
+            _log.Write($"Enable requested for '{GetAliasFor(stableKey)}' with {enableTargets.Count} candidate target(s).");
 
             // Show WORKING… and lock the row
             SetRowBusy(stableKey, true);
@@ -913,6 +1263,7 @@ namespace WorkMonitorSwitcher
                 LogMonitorAction($"ENABLE {stableKey}: trying target '{target}'.");
                 last = await ExecToolAsync("/enable", target);
                 LogMonitorAction($"ENABLE {stableKey}: target '{target}' exit={last.ExitCode}, stderr='{last.StdErr}'.");
+                _log.Write($"Enable attempt for '{GetAliasFor(stableKey)}' target '{target}': exit={last.ExitCode}, stderr='{last.StdErr}'.");
                 await Task.Delay(500);
 
                 var detectedNow = _detectSvc.Detect();
@@ -949,10 +1300,14 @@ namespace WorkMonitorSwitcher
             // If all are now active, restore saved layout
             if (_detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive))
             {
-                if (!_layoutSvc.LoadLayout(_layoutPath))
+                if (!_layoutSvc.LoadLayout(SelectedLayoutPath()))
                 {
                     // Optional: notify if missing
                     // ThemedMessageBox.Warn(this, "Saved monitor layout file not found.", "Monitor Switcher", _uiSettings.DarkMode);
+                }
+                else
+                {
+                    _log.Write($"Auto-restored layout profile '{SelectedLayoutProfileName()}' after all monitors became active.");
                 }
 
                 await Task.Delay(800);
@@ -1143,6 +1498,126 @@ namespace WorkMonitorSwitcher
             }
 
             return null;
+        }
+
+        private void RemoveShadowedDeviceAliases()
+        {
+            if (_aliasMap.Count == 0 || _detected.Count == 0) return;
+
+            var detectedKeys = new HashSet<string>(_detected.Select(d => d.StableKey), StringComparer.OrdinalIgnoreCase);
+            var presentByDevice = _detected
+                .Where(d => d.IsPresent && !string.IsNullOrWhiteSpace(d.DeviceName))
+                .Select(d => new
+                {
+                    Monitor = d,
+                    Device = NormalizeDeviceNameForComparison(d.DeviceName)
+                })
+                .Where(x => !string.IsNullOrWhiteSpace(x.Device))
+                .GroupBy(x => x.Device, StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() == 1)
+                .ToDictionary(g => g.Key, g => g.First().Monitor, StringComparer.OrdinalIgnoreCase);
+
+            if (presentByDevice.Count == 0) return;
+
+            foreach (var kv in _aliasMap.ToList())
+            {
+                var staleKey = kv.Key;
+                if (detectedKeys.Contains(staleKey) || !IsDeviceFallbackStableKey(staleKey))
+                    continue;
+
+                var source = kv.Value;
+                var keyDevice = NormalizeDeviceNameForComparison(staleKey);
+                var lastDevice = NormalizeDeviceNameForComparison(source.LastDeviceName);
+
+                DetectedMonitor? live = null;
+                if (!string.IsNullOrWhiteSpace(keyDevice))
+                    presentByDevice.TryGetValue(keyDevice, out live);
+                if (live == null && !string.IsNullOrWhiteSpace(lastDevice))
+                    presentByDevice.TryGetValue(lastDevice, out live);
+                if (live == null || live.StableKey.Equals(staleKey, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!_aliasMap.TryGetValue(live.StableKey, out var target))
+                {
+                    target = new MonitorInfo();
+                    _aliasMap[live.StableKey] = target;
+                }
+
+                MergeMonitorInfo(target, source, live.StableKey);
+                if (source.IsPreferredPrimary)
+                    EnsureOnlyPreferredPrimary(live.StableKey);
+
+                _aliasMap.Remove(staleKey);
+                _log.Write($"Removed stale saved display key '{staleKey}' because '{live.StableKey}' is present on {live.DeviceName}.");
+            }
+        }
+
+        private static bool IsDeviceFallbackStableKey(string stableKey)
+            => stableKey.Trim().StartsWith("DEV:", StringComparison.OrdinalIgnoreCase);
+
+        private static string NormalizeDeviceNameForComparison(string? value)
+        {
+            var t = NormaliseTarget(value ?? string.Empty).Trim();
+            if (t.StartsWith("DEV:", StringComparison.OrdinalIgnoreCase))
+                t = t[4..].Trim();
+
+            t = t.Replace('/', '\\');
+            while (t.Contains("\\\\", StringComparison.Ordinal))
+                t = t.Replace("\\\\", "\\");
+            return t;
+        }
+
+        private static void MergeMonitorInfo(MonitorInfo target, MonitorInfo source, string targetStableKey)
+        {
+            if (IsPlaceholderAlias(target.Name, targetStableKey) && !string.IsNullOrWhiteSpace(source.Name))
+                target.Name = source.Name;
+
+            if (source.IsPreferredPrimary)
+                target.IsPreferredPrimary = true;
+
+            if (!target.PreferredOrder.HasValue && source.PreferredOrder.HasValue)
+                target.PreferredOrder = source.PreferredOrder;
+            if (!target.LastKnownX.HasValue && source.LastKnownX.HasValue)
+                target.LastKnownX = source.LastKnownX;
+
+            target.LastDeviceName = FirstNonBlank(target.LastDeviceName, source.LastDeviceName);
+            target.LastRegistryKey = FirstNonBlank(target.LastRegistryKey, source.LastRegistryKey);
+            target.LastSerialNumber = FirstNonBlank(target.LastSerialNumber, source.LastSerialNumber);
+            target.LastInstanceId = FirstNonBlank(target.LastInstanceId, source.LastInstanceId);
+            target.LastMonitorId = FirstNonBlank(target.LastMonitorId, source.LastMonitorId);
+
+            foreach (var raw in source.KnownTargets)
+            {
+                var targetName = NormaliseTarget(raw);
+                if (string.IsNullOrWhiteSpace(targetName)) continue;
+                if (target.KnownTargets.Any(x => x.Equals(targetName, StringComparison.OrdinalIgnoreCase))) continue;
+                target.KnownTargets.Add(targetName);
+            }
+
+            const int MaxKnownTargets = 8;
+            if (target.KnownTargets.Count > MaxKnownTargets)
+                target.KnownTargets.RemoveRange(MaxKnownTargets, target.KnownTargets.Count - MaxKnownTargets);
+        }
+
+        private static bool IsPlaceholderAlias(string? alias, string stableKey)
+        {
+            if (string.IsNullOrWhiteSpace(alias)) return true;
+            var value = alias.Trim();
+            return value.Equals(stableKey, StringComparison.OrdinalIgnoreCase) ||
+                   value.StartsWith("DEV:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? FirstNonBlank(string? current, string? fallback)
+            => !string.IsNullOrWhiteSpace(current) ? current : fallback;
+
+        private void EnsureOnlyPreferredPrimary(string stableKey)
+        {
+            foreach (var key in _aliasMap.Keys.ToList())
+            {
+                var info = _aliasMap[key];
+                info.IsPreferredPrimary = key.Equals(stableKey, StringComparison.OrdinalIgnoreCase);
+                _aliasMap[key] = info;
+            }
         }
 
         private static string GetMonitorModelKey(string? monitorId)
@@ -1407,11 +1882,7 @@ namespace WorkMonitorSwitcher
         {
             if (!File.Exists(_toolPath))
             {
-                ThemedMessageBox.Warn(this,
-                    $"MultiMonitorTool.exe not found at: {_toolPath}\n" +
-                    "Download MultiMonitorTool from https://www.nirsoft.net/utils/multi_monitor_tool.html and place it beside the app executable.\n" +
-                    "Enable/disable/primary/layout actions will be unavailable. Detection will fall back to Screen.AllScreens.",
-                    "Monitor Switcher", _uiSettings.DarkMode);
+                _log.Write($"MultiMonitorTool.exe not found at {_toolPath}. Detection will use Screen.AllScreens fallback; monitor actions require the tool.");
             }
         }
 
@@ -1537,12 +2008,13 @@ namespace WorkMonitorSwitcher
 
         private void SaveWindowBounds()
         {
-            if (WindowState == FormWindowState.Normal)
+            var bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            if (bounds.Width > 0 && bounds.Height > 0)
             {
-                _uiSettings.WindowX = Bounds.X;
-                _uiSettings.WindowY = Bounds.Y;
-                _uiSettings.WindowWidth = Bounds.Width;
-                _uiSettings.WindowHeight = Bounds.Height;
+                _uiSettings.WindowX = bounds.X;
+                _uiSettings.WindowY = bounds.Y;
+                _uiSettings.WindowWidth = bounds.Width;
+                _uiSettings.WindowHeight = bounds.Height;
             }
         }
     }

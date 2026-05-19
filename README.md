@@ -6,14 +6,16 @@ Windows Forms utility for switching work monitor profiles with NirSoft `MultiMon
 
 - Detects connected monitors and keeps stable aliases for them.
 - Shows each monitor in a compact desktop UI with status, device hints, and quick enable/disable actions.
-- Saves and restores a full monitor layout when all displays are active again.
+- Saves and restores monitor layouts, including named layout profiles.
 - Lets you choose a preferred primary monitor, rename monitor aliases, toggle dark mode, and keep the main window always on top.
 - Opens saved monitor registry keys from Settings for easier monitor troubleshooting and alias setup.
+- Can minimize to the notification area and start with Windows.
 
 ## Requirements
 
 - Windows 10 or Windows 11
-- .NET 8 SDK for local development
+- GitHub release zip: no separate .NET install required
+- Local development: .NET 8 SDK
 - NirSoft `MultiMonitorTool`
 
 ## Third-Party Tool Setup
@@ -47,10 +49,19 @@ Settings includes:
 - Editable monitor aliases.
 - Preferred primary monitor selection.
 - Dark mode and always-on-top toggles.
+- Minimize-to-tray, start-with-Windows, and confirm-before-disable options.
 - **Edit cfg** for `MultiMonitorTool.cfg`.
-- **Open Registry** or double-clicking a registry-key cell to open Regedit at that monitor key.
+- **Open Registry** or double-clicking a registry-key cell to open Regedit at that monitor key. The grid shows a shortened class path, while tooltips/details and copy actions keep the full registry key.
 - **Download MultiMonitorTool** for the NirSoft helper executable.
 - **Update App** for downloading the latest GitHub release asset when one is published.
+- A monitor identity details panel.
+- A **Diagnostics** button that opens recent monitor action and layout profile events.
+
+## Layout Profiles
+
+Press **Save** to enter a layout profile name and capture the current monitor arrangement. Profile names are sanitized for safe file storage. Press **Restore** to load the currently selected profile. The active layout profile can be changed in Settings.
+
+The app still auto-restores the selected layout profile after all saved monitors become active again.
 
 ## Running Locally
 
@@ -63,7 +74,7 @@ If you want the monitor actions to work during local development, copy the NirSo
 
 ## Releases
 
-GitHub releases are packaged as a zip archive of the published app output. There is currently no installer; download the release zip, extract it to a folder, and run `MonitorSwitcher.exe`.
+GitHub releases are packaged as a self-contained Windows x64 zip archive. There is currently no installer; download the release zip, extract it to a folder, and run `MonitorSwitcher.exe`.
 
 If you want full monitor control features after extracting a release, use **Settings > Download MultiMonitorTool** or place `MultiMonitorTool.exe` and `MultiMonitorTool.cfg` beside `MonitorSwitcher.exe`.
 
@@ -73,6 +84,12 @@ The monitor layout snapshot is stored per user under:
 
 ```text
 %APPDATA%\WorkMonitorSwitcher\monitor-layout.cfg
+```
+
+Named layout profiles are stored under:
+
+```text
+%APPDATA%\WorkMonitorSwitcher\layouts
 ```
 
 Existing installs that previously used a layout file beside the executable are migrated automatically on first run.

@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace WorkMonitorSwitcher.Services
@@ -82,13 +83,8 @@ namespace WorkMonitorSwitcher.Services
                     btn.UseVisualStyleBackColor = false;
                     break;
 
-                case Panel pnl:
-                    // Let 1px rule lines keep their custom color; other panels follow background
-                    if (pnl.Height > 2)
-                        pnl.BackColor = pnl.BorderStyle == BorderStyle.None ? p.Back : p.Surface;
-                    break;
-
                 case DataGridView dgv:
+                    dgv.BackColor = p.Back;
                     dgv.BackgroundColor = p.Back;
                     dgv.GridColor = p.Border;
                     dgv.EnableHeadersVisualStyles = false;
@@ -109,6 +105,44 @@ namespace WorkMonitorSwitcher.Services
                     dgv.RowHeadersDefaultCellStyle.ForeColor = p.Text;
                     dgv.RowHeadersDefaultCellStyle.SelectionBackColor = p.Surface;
                     dgv.RowHeadersDefaultCellStyle.SelectionForeColor = p.Text;
+                    EnsureNativeScrollTheme(dgv);
+                    break;
+
+                case ComboBox combo:
+                    combo.BackColor = p.Back;
+                    combo.ForeColor = p.Text;
+                    combo.FlatStyle = FlatStyle.Flat;
+                    combo.DrawMode = DrawMode.OwnerDrawFixed;
+                    combo.DrawItem -= ComboDrawItem;
+                    combo.DrawItem += ComboDrawItem;
+                    combo.Tag = p;
+                    break;
+
+                case TextBox txt:
+                    txt.BackColor = p.Back;
+                    txt.ForeColor = p.Text;
+                    txt.BorderStyle = BorderStyle.FixedSingle;
+                    EnsureNativeScrollTheme(txt);
+                    break;
+
+                case TabControl tab:
+                    tab.BackColor = p.Back;
+                    tab.ForeColor = p.Text;
+                    tab.DrawMode = TabDrawMode.OwnerDrawFixed;
+                    tab.DrawItem -= TabDrawItem;
+                    tab.DrawItem += TabDrawItem;
+                    tab.Tag = p;
+                    break;
+
+                case TabPage page:
+                    page.BackColor = p.Back;
+                    page.ForeColor = p.Text;
+                    break;
+
+                case Panel pnl:
+                    // Let 1px rule lines keep their custom color; other panels follow background
+                    if (pnl.Height > 2)
+                        pnl.BackColor = pnl.BorderStyle == BorderStyle.None ? p.Back : p.Surface;
                     break;
 
                 default:
@@ -120,5 +154,67 @@ namespace WorkMonitorSwitcher.Services
             foreach (Control child in c.Controls)
                 ApplyToControl(child, p);
         }
+
+        private static void EnsureNativeScrollTheme(Control control)
+        {
+            ApplyNativeScrollTheme(control);
+            control.HandleCreated -= NativeScrollThemeHandleCreated;
+            control.HandleCreated += NativeScrollThemeHandleCreated;
+        }
+
+        private static void NativeScrollThemeHandleCreated(object? sender, EventArgs e)
+        {
+            if (sender is Control control)
+                ApplyNativeScrollTheme(control);
+        }
+
+        private static void ApplyNativeScrollTheme(Control control)
+        {
+            if (!control.IsHandleCreated) return;
+            bool dark = control.BackColor.GetBrightness() < 0.5f;
+            try { SetWindowTheme(control.Handle, dark ? "DarkMode_Explorer" : "Explorer", null); }
+            catch { /* best effort only */ }
+        }
+
+        private static void ComboDrawItem(object? sender, DrawItemEventArgs e)
+        {
+            if (sender is not ComboBox combo || e.Index < 0)
+                return;
+
+            var p = combo.Tag as ThemePalette ?? ThemePalette.Light();
+            bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+            using var back = new SolidBrush(selected ? ControlPaint.Light(p.Surface, 0.12f) : p.Back);
+            using var fore = new SolidBrush(p.Text);
+
+            e.Graphics.FillRectangle(back, e.Bounds);
+            var text = combo.GetItemText(combo.Items[e.Index]);
+            TextRenderer.DrawText(e.Graphics, text, combo.Font, e.Bounds, p.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            e.DrawFocusRectangle();
+        }
+
+        private static void TabDrawItem(object? sender, DrawItemEventArgs e)
+        {
+            if (sender is not TabControl tab || e.Index < 0)
+                return;
+
+            var p = tab.Tag as ThemePalette ?? ThemePalette.Light();
+            bool selected = tab.SelectedIndex == e.Index;
+            var bounds = tab.GetTabRect(e.Index);
+            using var back = new SolidBrush(selected ? p.Back : p.Surface);
+            using var border = new Pen(p.Border);
+
+            e.Graphics.FillRectangle(back, bounds);
+            e.Graphics.DrawRectangle(border, bounds);
+            TextRenderer.DrawText(
+                e.Graphics,
+                tab.TabPages[e.Index].Text,
+                tab.Font,
+                bounds,
+                p.Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetWindowTheme(IntPtr hWnd, string? pszSubAppName, string? pszSubIdList);
     }
 }

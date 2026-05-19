@@ -1,5 +1,28 @@
 # Release Notes
 
+## Unreleased
+
+## v0.3.0 - 2026-05-19
+
+### Added
+
+- Added named layout profiles with prompted **Save** and explicit **Restore** actions.
+- Added notification-area support with a tray menu for open, refresh, save, restore, settings, and exit.
+- Added Settings options for minimize-to-tray, start-with-Windows, and confirm-before-disable.
+- Added a missing-`MultiMonitorTool` banner on the main window.
+- Added a monitor identity details panel in Settings.
+- Added a **Diagnostics** button that opens recent monitor action and layout profile events.
+
+### Improved
+
+- Automatic restore now uses the selected layout profile.
+- Settings now shows shortened registry class paths in the grid while preserving full registry keys for tooltips, copying, details, and Regedit opening.
+- Layout profile names are sanitized before storage to avoid invalid filename characters and profile-file collisions.
+- Missing `MultiMonitorTool.exe` is reported in the main-window banner and diagnostics log instead of interrupting every startup with a modal warning.
+- Release zips are now self-contained Windows x64 packages.
+- Release workflow now has the permissions needed to attach generated release zips.
+- Manual release workflow runs only attach assets to a GitHub release when a tag is supplied.
+
 ## v0.2.0
 
 ### Added

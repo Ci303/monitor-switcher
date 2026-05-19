@@ -12,6 +12,10 @@ namespace WorkMonitorSwitcher.Model
         public int WindowWidth { get; set; }
         public int WindowHeight { get; set; }
         public bool AlwaysOnTop { get; set; }   // default false
+        public bool MinimizeToTray { get; set; }
+        public bool StartWithWindows { get; set; }
+        public bool ConfirmBeforeDisable { get; set; } = true;
+        public string SelectedLayoutProfile { get; set; } = "Default";
 
     }
 
@@ -60,7 +64,38 @@ namespace WorkMonitorSwitcher.Model
         public string StableKey { get; set; } = string.Empty;   // Full stable key (shown in tooltip)
         public string ShortKey { get; set; } = string.Empty;    // Abbreviated display in grid
         public string RegistryKey { get; set; } = string.Empty; // Copyable registry path
+        public string RegistryKeyShort => ShortenRegistryKey(RegistryKey);
         public string? Alias { get; set; }                      // Editable alias
         public bool IsPreferredPrimary { get; set; }
+        public string DeviceName { get; set; } = string.Empty;
+        public string MonitorName { get; set; } = string.Empty;
+        public string MonitorId { get; set; } = string.Empty;
+        public string InstanceId { get; set; } = string.Empty;
+        public string SerialNumber { get; set; } = string.Empty;
+        public string KnownTargets { get; set; } = string.Empty;
+        public string StableKeyFull => StableKey;
+
+        private static string ShortenRegistryKey(string raw)
+        {
+            var value = (raw ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+
+            const string classMarker = @"\Control\Class\";
+            var markerIndex = value.IndexOf(classMarker, StringComparison.OrdinalIgnoreCase);
+            if (markerIndex >= 0)
+                return value[(markerIndex + classMarker.Length)..].TrimStart('\\');
+
+            const string machinePrefix = @"\Registry\Machine\";
+            if (value.StartsWith(machinePrefix, StringComparison.OrdinalIgnoreCase))
+                value = value[machinePrefix.Length..];
+
+            var parts = value
+                .Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+
+            return parts.Length >= 2
+                ? string.Join("\\", parts[^2], parts[^1])
+                : value;
+        }
     }
 }

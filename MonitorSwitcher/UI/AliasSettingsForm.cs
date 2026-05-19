@@ -43,10 +43,21 @@ namespace WorkMonitorSwitcher
         private readonly Button _editCfg = new() { Text = "Edit cfg", AutoSize = true };
         private readonly Button _downloadTool = new() { Text = "Download MultiMonitorTool", AutoSize = true };
         private readonly Button _updateApp = new() { Text = "Update App", AutoSize = true };
+        private readonly Button _showDiagnostics = new() { Text = "Diagnostics", AutoSize = true };
         private readonly CheckBox _chkDark = new() { Text = "Dark mode", AutoSize = true };
         private readonly CheckBox _chkTopMost = new() { Text = "Always on top", AutoSize = true };
+        private readonly CheckBox _chkTray = new() { Text = "Minimize to tray", AutoSize = true };
+        private readonly CheckBox _chkStartup = new() { Text = "Start with Windows", AutoSize = true };
+        private readonly CheckBox _chkConfirmDisable = new() { Text = "Confirm before disabling", AutoSize = true };
+        private readonly Button _layoutProfileButton = new() { Text = "Default", AutoSize = false, Size = new Size(150, 26), TextAlign = ContentAlignment.MiddleLeft };
+        private readonly Button _deleteProfile = new() { Text = "Delete Profile", AutoSize = false, Size = new Size(96, 26) };
+        private readonly TextBox _details = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
         private readonly BindingList<AliasViewRow> _rows;
         private readonly string _cfgPath;
+        private readonly string _diagnosticsText;
+        private readonly List<string> _layoutProfileNames;
+        private string _selectedLayoutProfile;
+        private ContextMenuStrip? _layoutProfileMenu;
         private readonly ToolTip _toolTip = new() { InitialDelay = 350, ReshowDelay = 100, AutoPopDelay = 8000 };
         private static readonly HttpClient Http = new();
         private const string MultiMonitorToolZipUrl = "https://www.nirsoft.net/utils/multimonitortool-x64.zip";
@@ -57,14 +68,41 @@ namespace WorkMonitorSwitcher
         public bool? DarkModeResult { get; private set; }
         public string? PreferredPrimaryKey { get; private set; }
         public bool? AlwaysOnTopResult { get; private set; }
+        public bool? MinimizeToTrayResult { get; private set; }
+        public bool? StartWithWindowsResult { get; private set; }
+        public bool? ConfirmBeforeDisableResult { get; private set; }
+        public string? SelectedLayoutProfileResult { get; private set; }
+        public HashSet<string> RemovedLayoutProfiles { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-
-
-        public AliasSettingsForm(List<AliasViewRow> current, bool darkMode, bool alwaysOnTop, string cfgPath)
+        public AliasSettingsForm(
+            List<AliasViewRow> current,
+            bool darkMode,
+            bool alwaysOnTop,
+            bool minimizeToTray,
+            bool startWithWindows,
+            bool confirmBeforeDisable,
+            string cfgPath,
+            List<string> layoutProfiles,
+            string selectedLayoutProfile,
+            string diagnosticsText)
 
         {
             _rows = new BindingList<AliasViewRow>(current);
             _cfgPath = cfgPath ?? string.Empty;
+            _diagnosticsText = string.IsNullOrWhiteSpace(diagnosticsText)
+                ? "No diagnostic events have been recorded yet."
+                : diagnosticsText;
+            _layoutProfileNames = layoutProfiles
+                .Where(p => !string.IsNullOrWhiteSpace(p))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(p => p.Equals("Default", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (_layoutProfileNames.Count == 0)
+                _layoutProfileNames.Add("Default");
+            _selectedLayoutProfile = string.IsNullOrWhiteSpace(selectedLayoutProfile) ? "Default" : selectedLayoutProfile.Trim();
+            if (!_layoutProfileNames.Any(p => p.Equals(_selectedLayoutProfile, StringComparison.OrdinalIgnoreCase)))
+                _layoutProfileNames.Add(_selectedLayoutProfile);
 
             Text = "Monitor Switcher Settings";
             StartPosition = FormStartPosition.CenterParent;
@@ -80,10 +118,14 @@ namespace WorkMonitorSwitcher
             {
                 // Non-fatal: the dialog can still open without a title bar icon.
             }
-            MinimumSize = new Size(760, 430);
+            MinimumSize = new Size(920, 430);
             Size = new Size(980, 600);
             _chkDark.Checked = darkMode;
             _chkTopMost.Checked = alwaysOnTop;
+            _chkTray.Checked = minimizeToTray;
+            _chkStartup.Checked = startWithWindows;
+            _chkConfirmDisable.Checked = confirmBeforeDisable;
+            SetSelectedLayoutProfile(_selectedLayoutProfile);
             _grid.RowHeadersVisible = false;
             _grid.AllowUserToOrderColumns = true;
             _grid.MultiSelect = true;
@@ -103,7 +145,7 @@ namespace WorkMonitorSwitcher
             var regCol = new DataGridViewTextBoxColumn
             {
                 HeaderText = "Registry Key",
-                DataPropertyName = nameof(AliasViewRow.RegistryKey),
+                DataPropertyName = nameof(AliasViewRow.RegistryKeyShort),
                 ReadOnly = true,
                 FillWeight = 44,
                 MinimumWidth = 220
@@ -147,6 +189,13 @@ namespace WorkMonitorSwitcher
                     var row = _rows[e.RowIndex];
                     _grid.Rows[e.RowIndex].Cells[e.ColumnIndex].ToolTipText = row.StableKey;
                 }
+                else if (e.RowIndex >= 0 &&
+                         e.ColumnIndex >= 0 &&
+                         _grid.Columns[e.ColumnIndex].DataPropertyName == nameof(AliasViewRow.RegistryKeyShort))
+                {
+                    var row = _rows[e.RowIndex];
+                    _grid.Rows[e.RowIndex].Cells[e.ColumnIndex].ToolTipText = row.RegistryKey;
+                }
             };
 
             // Ctrl+C copies current cell text
@@ -154,7 +203,9 @@ namespace WorkMonitorSwitcher
             {
                 if (e.Control && e.KeyCode == Keys.C && _grid.CurrentCell != null)
                 {
-                    var text = Convert.ToString(_grid.CurrentCell.Value) ?? string.Empty;
+                    var text = _grid.Columns[_grid.CurrentCell.ColumnIndex].DataPropertyName == nameof(AliasViewRow.RegistryKeyShort)
+                        ? _rows[_grid.CurrentCell.RowIndex].RegistryKey
+                        : Convert.ToString(_grid.CurrentCell.Value) ?? string.Empty;
                     if (!string.IsNullOrEmpty(text))
                         Clipboard.SetText(text);
                     e.Handled = true;
@@ -184,21 +235,31 @@ namespace WorkMonitorSwitcher
             _grid.CellDoubleClick += (_, e) =>
             {
                 if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-                if (_grid.Columns[e.ColumnIndex].DataPropertyName == nameof(AliasViewRow.RegistryKey))
+                if (_grid.Columns[e.ColumnIndex].DataPropertyName == nameof(AliasViewRow.RegistryKeyShort))
                     OpenRegistryForRow(e.RowIndex);
             };
+            _grid.SelectionChanged += (_, __) => UpdateDetailsPanel();
             _remove.Click += (_, __) => RemoveSelectedRows();
             _openRegistry.Click += (_, __) => OpenRegistryForSelectedRow();
+            _layoutProfileButton.Click += (_, __) => ShowLayoutProfileMenu();
+            _deleteProfile.Click += (_, __) => DeleteSelectedProfile();
             _editCfg.Click += (_, __) => ChooseAndOpenCfg();
             _downloadTool.Click += async (_, __) => await DownloadToolAsync();
             _updateApp.Click += async (_, __) => await UpdateAppAsync();
+            _showDiagnostics.Click += (_, __) => ShowDiagnosticsDialog();
             _toolTip.SetToolTip(_chkDark, "Use the dark color theme.");
             _toolTip.SetToolTip(_chkTopMost, "Keep the main switcher window above other windows.");
+            _toolTip.SetToolTip(_chkTray, "Close to the notification area instead of exiting.");
+            _toolTip.SetToolTip(_chkStartup, "Start Monitor Switcher when you sign in to Windows.");
+            _toolTip.SetToolTip(_chkConfirmDisable, "Ask before disabling a monitor.");
+            _toolTip.SetToolTip(_layoutProfileButton, "Current layout profile used by the main window.");
+            _toolTip.SetToolTip(_deleteProfile, "Delete the selected saved layout profile. Default cannot be deleted.");
             _toolTip.SetToolTip(_remove, "Remove selected saved monitor entries.");
             _toolTip.SetToolTip(_openRegistry, "Open Registry Editor at the selected monitor key.");
             _toolTip.SetToolTip(_editCfg, "Open MultiMonitorTool.cfg.");
             _toolTip.SetToolTip(_downloadTool, "Download the official NirSoft helper beside the app.");
             _toolTip.SetToolTip(_updateApp, "Download the latest GitHub release asset if one is published.");
+            _toolTip.SetToolTip(_showDiagnostics, "Show recent monitor action and layout profile events.");
 
             // Top bar
             var topBar = new FlowLayoutPanel
@@ -211,17 +272,42 @@ namespace WorkMonitorSwitcher
             };
             _chkDark.Margin = new Padding(0, 3, 18, 3);
             _chkTopMost.Margin = new Padding(0, 3, 18, 3);
+            _chkTray.Margin = new Padding(0, 3, 18, 3);
+            _chkStartup.Margin = new Padding(0, 3, 18, 3);
+            _chkConfirmDisable.Margin = new Padding(0, 3, 18, 3);
             topBar.Controls.Add(_chkDark);
             topBar.Controls.Add(_chkTopMost);
+            topBar.Controls.Add(_chkTray);
+            topBar.Controls.Add(_chkStartup);
+            topBar.Controls.Add(_chkConfirmDisable);
 
-            // Bottom actions
+            var profileBar = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 42,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Padding = new Padding(12, 7, 12, 5)
+            };
+            var profileLabel = new Label
+            {
+                Text = "Layout profile",
+                AutoSize = true,
+                Margin = new Padding(0, 5, 8, 0)
+            };
+            _layoutProfileButton.Margin = new Padding(0, 0, 8, 0);
+            _deleteProfile.Margin = new Padding(0, 0, 8, 0);
+            profileBar.Controls.Add(profileLabel);
+            profileBar.Controls.Add(_layoutProfileButton);
+            profileBar.Controls.Add(_deleteProfile);
+
             var bottom = new TableLayoutPanel
             {
                 Dock = DockStyle.Bottom,
                 ColumnCount = 2,
                 RowCount = 1,
-                Padding = new Padding(12, 10, 12, 12),
-                Height = 58
+                Padding = new Padding(12, 8, 12, 10),
+                Height = 54
             };
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -241,21 +327,35 @@ namespace WorkMonitorSwitcher
                 AutoSize = true
             };
 
-            foreach (var button in new[] { _editCfg, _openRegistry, _downloadTool, _updateApp, _remove, _cancel, _ok })
+            foreach (var button in new[] { _editCfg, _openRegistry, _downloadTool, _updateApp, _showDiagnostics, _remove, _cancel, _ok })
                 button.Margin = new Padding(0, 0, 8, 0);
 
             toolActions.Controls.Add(_editCfg);
             toolActions.Controls.Add(_openRegistry);
             toolActions.Controls.Add(_downloadTool);
             toolActions.Controls.Add(_updateApp);
+            toolActions.Controls.Add(_showDiagnostics);
             commitActions.Controls.Add(_ok);
             commitActions.Controls.Add(_cancel);
             commitActions.Controls.Add(_remove);
             bottom.Controls.Add(toolActions, 0, 0);
             bottom.Controls.Add(commitActions, 1, 0);
 
-            Controls.Add(_grid);
+            var monitorLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(8, 8, 8, 0)
+            };
+            monitorLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 72));
+            monitorLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
+            monitorLayout.Controls.Add(_grid, 0, 0);
+            monitorLayout.Controls.Add(_details, 1, 0);
+
+            Controls.Add(monitorLayout);
             Controls.Add(topBar);
+            Controls.Add(profileBar);
             Controls.Add(bottom);
 
             AcceptButton = _ok;
@@ -276,9 +376,15 @@ namespace WorkMonitorSwitcher
                 DarkModeResult = _chkDark.Checked;
                 PreferredPrimaryKey = _rows.FirstOrDefault(r => r.IsPreferredPrimary)?.StableKey;
                 AlwaysOnTopResult = _chkTopMost.Checked;
+                MinimizeToTrayResult = _chkTray.Checked;
+                StartWithWindowsResult = _chkStartup.Checked;
+                ConfirmBeforeDisableResult = _chkConfirmDisable.Checked;
+                SelectedLayoutProfileResult = _selectedLayoutProfile;
                 DialogResult = DialogResult.OK;
                 Close();
             };
+
+            UpdateDetailsPanel();
         }
 
         private void RemoveSelectedRows()
@@ -309,6 +415,114 @@ namespace WorkMonitorSwitcher
                 RemovedKeys.Add(_rows[rowIndex].StableKey);
                 _rows.RemoveAt(rowIndex);
             }
+            UpdateDetailsPanel();
+        }
+
+        private void DeleteSelectedProfile()
+        {
+            var profile = (_selectedLayoutProfile ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(profile) || profile.Equals("Default", StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show(this, "The Default layout profile cannot be deleted.", "Delete Profile",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (MessageBox.Show(this, $"Delete layout profile '{profile}'?", "Delete Profile",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            {
+                return;
+            }
+
+            RemovedLayoutProfiles.Add(profile);
+            _layoutProfileNames.RemoveAll(p => p.Equals(profile, StringComparison.OrdinalIgnoreCase));
+            SetSelectedLayoutProfile(_layoutProfileNames.FirstOrDefault() ?? "Default");
+        }
+
+        private void SetSelectedLayoutProfile(string profile)
+        {
+            _selectedLayoutProfile = string.IsNullOrWhiteSpace(profile) ? "Default" : profile.Trim();
+            _layoutProfileButton.Text = _selectedLayoutProfile;
+            BuildLayoutProfileMenu();
+        }
+
+        private void BuildLayoutProfileMenu()
+        {
+            _layoutProfileMenu?.Dispose();
+
+            var palette = _chkDark.Checked ? ThemePalette.Dark() : ThemePalette.Light();
+            _layoutProfileMenu = new ContextMenuStrip
+            {
+                BackColor = palette.Back,
+                ForeColor = palette.Text,
+                Renderer = new LayoutProfileMenuRenderer(palette),
+                ShowCheckMargin = true,
+                ShowImageMargin = false
+            };
+
+            _layoutProfileMenu.BackColor = palette.Surface;
+            _layoutProfileMenu.ForeColor = palette.Text;
+
+            foreach (var profile in _layoutProfileNames
+                         .OrderBy(p => p.Equals("Default", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                         .ThenBy(p => p, StringComparer.OrdinalIgnoreCase))
+            {
+                var item = new ToolStripMenuItem(profile)
+                {
+                    Checked = profile.Equals(_selectedLayoutProfile, StringComparison.OrdinalIgnoreCase),
+                    ForeColor = palette.Text
+                };
+                item.Click += (_, __) => SetSelectedLayoutProfile(profile);
+                _layoutProfileMenu.Items.Add(item);
+            }
+        }
+
+        private void ShowLayoutProfileMenu()
+        {
+            BuildLayoutProfileMenu();
+            _layoutProfileMenu?.Show(_layoutProfileButton, new Point(0, _layoutProfileButton.Height));
+        }
+
+        private void ShowDiagnosticsDialog()
+        {
+            try
+            {
+                var path = Path.Combine(Path.GetTempPath(), "MonitorSwitcher-diagnostics.txt");
+                File.WriteAllText(path, _diagnosticsText);
+                Process.Start(new ProcessStartInfo("notepad.exe", $"\"{path}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Unable to open diagnostics.\n{ex.Message}", "Diagnostics",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void UpdateDetailsPanel()
+        {
+            var rowIndex = _grid.CurrentCell?.RowIndex ?? -1;
+            if (rowIndex < 0 || rowIndex >= _rows.Count)
+            {
+                _details.Text = "Select a monitor to view saved identity details.";
+                return;
+            }
+
+            var row = _rows[rowIndex];
+            _details.Text =
+                $"Alias: {row.Alias}{Environment.NewLine}" +
+                $"Preferred primary: {(row.IsPreferredPrimary ? "Yes" : "No")}{Environment.NewLine}" +
+                $"{Environment.NewLine}" +
+                $"Stable key:{Environment.NewLine}{row.StableKeyFull}{Environment.NewLine}" +
+                $"{Environment.NewLine}" +
+                $"Registry key:{Environment.NewLine}{row.RegistryKey}{Environment.NewLine}" +
+                $"{Environment.NewLine}" +
+                $"Device name: {row.DeviceName}{Environment.NewLine}" +
+                $"Monitor name: {row.MonitorName}{Environment.NewLine}" +
+                $"Monitor ID: {row.MonitorId}{Environment.NewLine}" +
+                $"Instance ID: {row.InstanceId}{Environment.NewLine}" +
+                $"Serial number: {row.SerialNumber}{Environment.NewLine}" +
+                $"{Environment.NewLine}" +
+                $"Known command targets:{Environment.NewLine}{row.KnownTargets}";
         }
 
         private void OpenRegistryForSelectedRow()
@@ -645,10 +859,84 @@ namespace WorkMonitorSwitcher
 
             // Title bar
             DwmInterop.SetDarkTitleBar(this.Handle, dark);
+            BuildLayoutProfileMenu();
 
             // We don’t set caption color here; leaving it to system accent avoids visual mismatch
             Invalidate(true);
             Update();
+        }
+
+        private sealed class LayoutProfileMenuRenderer : ToolStripProfessionalRenderer
+        {
+            private readonly ThemePalette _palette;
+
+            public LayoutProfileMenuRenderer(ThemePalette palette)
+                : base(new LayoutProfileColorTable(palette))
+            {
+                _palette = palette;
+            }
+
+            protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+            {
+                var item = e.Item as ToolStripMenuItem;
+                bool selected = e.Item.Selected;
+                bool isChecked = item?.Checked == true;
+
+                var bounds = new Rectangle(Point.Empty, e.Item.Size);
+                var backColor = selected
+                    ? ControlPaint.Light(_palette.Surface, 0.18f)
+                    : isChecked
+                        ? ControlPaint.Light(_palette.Surface, 0.08f)
+                        : _palette.Back;
+
+                using var back = new SolidBrush(backColor);
+                e.Graphics.FillRectangle(back, bounds);
+
+                if (selected || isChecked)
+                {
+                    using var border = new Pen(_palette.Border);
+                    e.Graphics.DrawRectangle(border, 0, 0, bounds.Width - 1, bounds.Height - 1);
+                }
+            }
+
+            protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+            {
+                e.TextColor = _palette.Text;
+                base.OnRenderItemText(e);
+            }
+
+            protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
+            {
+                using var back = new SolidBrush(_palette.Surface);
+                e.Graphics.FillRectangle(back, e.AffectedBounds);
+            }
+        }
+
+        private sealed class LayoutProfileColorTable : ProfessionalColorTable
+        {
+            private readonly ThemePalette _palette;
+            private readonly Color _selected;
+            private readonly Color _checked;
+
+            public LayoutProfileColorTable(ThemePalette palette)
+            {
+                _palette = palette;
+                _selected = ControlPaint.Light(palette.Surface, 0.18f);
+                _checked = ControlPaint.Light(palette.Surface, 0.08f);
+            }
+
+            public override Color ToolStripDropDownBackground => _palette.Back;
+            public override Color ImageMarginGradientBegin => _palette.Surface;
+            public override Color ImageMarginGradientMiddle => _palette.Surface;
+            public override Color ImageMarginGradientEnd => _palette.Surface;
+            public override Color MenuBorder => _palette.Border;
+            public override Color MenuItemBorder => _palette.Border;
+            public override Color MenuItemSelected => _selected;
+            public override Color MenuItemSelectedGradientBegin => _selected;
+            public override Color MenuItemSelectedGradientEnd => _selected;
+            public override Color CheckBackground => _checked;
+            public override Color CheckPressedBackground => _selected;
+            public override Color CheckSelectedBackground => _selected;
         }
     }
 }

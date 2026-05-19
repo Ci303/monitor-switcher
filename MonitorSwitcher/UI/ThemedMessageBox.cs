@@ -19,6 +19,30 @@ namespace WorkMonitorSwitcher.UI
 
         private static DialogResult Show(IWin32Window owner, string text, string title, bool dark, Icon icon)
         {
+            const int margin = 16;
+            const int iconSize = 32;
+            const int gap = 12;
+            const int buttonWidth = 80;
+            const int buttonHeight = 28;
+            const int maxTextWidth = 440;
+            const int minTextWidth = 240;
+
+            var measureFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl;
+            var measured = TextRenderer.MeasureText(
+                text,
+                SystemFonts.MessageBoxFont,
+                new Size(maxTextWidth, int.MaxValue),
+                measureFlags);
+            int textWidth = Math.Clamp(measured.Width + 4, minTextWidth, maxTextWidth);
+            measured = TextRenderer.MeasureText(
+                text,
+                SystemFonts.MessageBoxFont,
+                new Size(textWidth, int.MaxValue),
+                measureFlags);
+            int contentHeight = Math.Max(iconSize, measured.Height + 4);
+            int clientWidth = margin + iconSize + gap + textWidth + margin;
+            int clientHeight = margin + contentHeight + 18 + buttonHeight + margin;
+
             // Dialog shell
             using var dlg = new Form
             {
@@ -29,8 +53,8 @@ namespace WorkMonitorSwitcher.UI
                 MinimizeBox = false,
                 ShowInTaskbar = false,
                 AutoScaleMode = AutoScaleMode.Dpi,
-                Width = 200,
-                Height = 170
+                Font = SystemFonts.MessageBoxFont,
+                ClientSize = new Size(clientWidth, clientHeight)
             };
 
             // Icon
@@ -46,9 +70,10 @@ namespace WorkMonitorSwitcher.UI
             var lbl = new Label
             {
                 AutoSize = false,
-                Location = new Point(60, 18),
-                Size = new Size(dlg.ClientSize.Width - 76, 70),
-                Text = text
+                Location = new Point(margin + iconSize + gap, margin),
+                Size = new Size(textWidth, contentHeight),
+                Text = text,
+                UseMnemonic = false
             };
 
             // OK button
@@ -56,7 +81,7 @@ namespace WorkMonitorSwitcher.UI
             {
                 Text = "OK",
                 DialogResult = DialogResult.OK,
-                Size = new Size(80, 28),
+                Size = new Size(buttonWidth, buttonHeight),
             };
             ok.Location = new Point(dlg.ClientSize.Width - ok.Width - 16,
                                     dlg.ClientSize.Height - ok.Height - 16);
