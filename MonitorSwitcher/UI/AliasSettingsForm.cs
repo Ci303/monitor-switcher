@@ -13,6 +13,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using WorkMonitorSwitcher.Model;
 using WorkMonitorSwitcher.Services;
 
@@ -38,6 +39,7 @@ namespace WorkMonitorSwitcher
         private readonly Button _ok = new() { Text = "OK", DialogResult = DialogResult.OK, AutoSize = true };
         private readonly Button _cancel = new() { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
         private readonly Button _remove = new() { Text = "Remove Selected", AutoSize = true };
+        private readonly Button _openRegistry = new() { Text = "Open Registry", AutoSize = true };
         private readonly Button _editCfg = new() { Text = "Edit cfg", AutoSize = true };
         private readonly Button _downloadTool = new() { Text = "Download MultiMonitorTool", AutoSize = true };
         private readonly Button _updateApp = new() { Text = "Update App", AutoSize = true };
@@ -45,6 +47,7 @@ namespace WorkMonitorSwitcher
         private readonly CheckBox _chkTopMost = new() { Text = "Always on top", AutoSize = true };
         private readonly BindingList<AliasViewRow> _rows;
         private readonly string _cfgPath;
+        private readonly ToolTip _toolTip = new() { InitialDelay = 350, ReshowDelay = 100, AutoPopDelay = 8000 };
         private static readonly HttpClient Http = new();
         private const string MultiMonitorToolZipUrl = "https://www.nirsoft.net/utils/multimonitortool-x64.zip";
         private const string LatestReleaseApiUrl = "https://api.github.com/repos/Ci303/monitor-switcher/releases/latest";
@@ -63,37 +66,55 @@ namespace WorkMonitorSwitcher
             _rows = new BindingList<AliasViewRow>(current);
             _cfgPath = cfgPath ?? string.Empty;
 
-            Text = "Monitor Aliases";
+            Text = "Monitor Switcher Settings";
             StartPosition = FormStartPosition.CenterParent;
             FormBorderStyle = FormBorderStyle.Sizable;
             MaximizeBox = true;
             MinimizeBox = true;
-            MinimumSize = new Size(640, 360);
-            Size = new Size(920, 560);
+            ShowIcon = true;
+            try
+            {
+                Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch
+            {
+                // Non-fatal: the dialog can still open without a title bar icon.
+            }
+            MinimumSize = new Size(760, 430);
+            Size = new Size(980, 600);
             _chkDark.Checked = darkMode;
             _chkTopMost.Checked = alwaysOnTop;
+            _grid.RowHeadersVisible = false;
+            _grid.AllowUserToOrderColumns = true;
+            _grid.MultiSelect = true;
+            _grid.ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText;
+            _grid.BorderStyle = BorderStyle.None;
+            _grid.RowTemplate.Height = 28;
 
             // Columns
             var shortKeyCol = new DataGridViewTextBoxColumn
             {
-                HeaderText = "Stable Key (short)",
+                HeaderText = "Stable Key",
                 DataPropertyName = nameof(AliasViewRow.ShortKey),
                 ReadOnly = true,
-                FillWeight = 28
+                FillWeight = 28,
+                MinimumWidth = 150
             };
             var regCol = new DataGridViewTextBoxColumn
             {
                 HeaderText = "Registry Key",
                 DataPropertyName = nameof(AliasViewRow.RegistryKey),
                 ReadOnly = true,
-                FillWeight = 47
+                FillWeight = 44,
+                MinimumWidth = 220
             };
             var aliasCol = new DataGridViewTextBoxColumn
             {
                 HeaderText = "Alias",
                 DataPropertyName = nameof(AliasViewRow.Alias),
                 ReadOnly = false,
-                FillWeight = 25
+                FillWeight = 28,
+                MinimumWidth = 160
             };
             var primaryCol = new DataGridViewCheckBoxColumn
 
@@ -101,7 +122,8 @@ namespace WorkMonitorSwitcher
                 HeaderText = "Primary",
                 DataPropertyName = nameof(AliasViewRow.IsPreferredPrimary),
                 ReadOnly = false,
-                FillWeight = 12
+                FillWeight = 10,
+                MinimumWidth = 70
             };
 
             primaryCol.ThreeState = false;
@@ -159,49 +181,82 @@ namespace WorkMonitorSwitcher
                     }
                 }
             };
+            _grid.CellDoubleClick += (_, e) =>
+            {
+                if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+                if (_grid.Columns[e.ColumnIndex].DataPropertyName == nameof(AliasViewRow.RegistryKey))
+                    OpenRegistryForRow(e.RowIndex);
+            };
             _remove.Click += (_, __) => RemoveSelectedRows();
+            _openRegistry.Click += (_, __) => OpenRegistryForSelectedRow();
             _editCfg.Click += (_, __) => ChooseAndOpenCfg();
             _downloadTool.Click += async (_, __) => await DownloadToolAsync();
             _updateApp.Click += async (_, __) => await UpdateAppAsync();
+            _toolTip.SetToolTip(_chkDark, "Use the dark color theme.");
+            _toolTip.SetToolTip(_chkTopMost, "Keep the main switcher window above other windows.");
+            _toolTip.SetToolTip(_remove, "Remove selected saved monitor entries.");
+            _toolTip.SetToolTip(_openRegistry, "Open Registry Editor at the selected monitor key.");
+            _toolTip.SetToolTip(_editCfg, "Open MultiMonitorTool.cfg.");
+            _toolTip.SetToolTip(_downloadTool, "Download the official NirSoft helper beside the app.");
+            _toolTip.SetToolTip(_updateApp, "Download the latest GitHub release asset if one is published.");
 
-            // Top bar (dark mode toggle)
+            // Top bar
             var topBar = new FlowLayoutPanel
             {
                 Dock = DockStyle.Top,
-                Height = 38,
+                Height = 44,
                 FlowDirection = FlowDirection.LeftToRight,
-                Padding = new Padding(10, 8, 10, 4),
+                Padding = new Padding(12, 10, 12, 6),
                 AutoSize = false
             };
+            _chkDark.Margin = new Padding(0, 3, 18, 3);
+            _chkTopMost.Margin = new Padding(0, 3, 18, 3);
             topBar.Controls.Add(_chkDark);
             topBar.Controls.Add(_chkTopMost);
 
-            // Bottom buttons
-            var buttons = new FlowLayoutPanel
+            // Bottom actions
+            var bottom = new TableLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                FlowDirection = FlowDirection.RightToLeft,
-                AutoSize = true,
-                WrapContents = false,
-                Padding = new Padding(10),
-                Height = 52
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(12, 10, 12, 12),
+                Height = 58
             };
-            _ok.Margin = new Padding(6, 6, 0, 6);
-            _cancel.Margin = new Padding(6, 6, 6, 6);
-            _remove.Margin = new Padding(6, 6, 6, 6);
-            _editCfg.Margin = new Padding(6, 6, 6, 6);
-            _downloadTool.Margin = new Padding(6, 6, 6, 6);
-            _updateApp.Margin = new Padding(6, 6, 6, 6);
-            buttons.Controls.Add(_ok);
-            buttons.Controls.Add(_cancel);
-            buttons.Controls.Add(_remove);
-            buttons.Controls.Add(_editCfg);
-            buttons.Controls.Add(_downloadTool);
-            buttons.Controls.Add(_updateApp);
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            var toolActions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                AutoSize = true
+            };
+            var commitActions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                AutoSize = true
+            };
+
+            foreach (var button in new[] { _editCfg, _openRegistry, _downloadTool, _updateApp, _remove, _cancel, _ok })
+                button.Margin = new Padding(0, 0, 8, 0);
+
+            toolActions.Controls.Add(_editCfg);
+            toolActions.Controls.Add(_openRegistry);
+            toolActions.Controls.Add(_downloadTool);
+            toolActions.Controls.Add(_updateApp);
+            commitActions.Controls.Add(_ok);
+            commitActions.Controls.Add(_cancel);
+            commitActions.Controls.Add(_remove);
+            bottom.Controls.Add(toolActions, 0, 0);
+            bottom.Controls.Add(commitActions, 1, 0);
 
             Controls.Add(_grid);
             Controls.Add(topBar);
-            Controls.Add(buttons);
+            Controls.Add(bottom);
 
             AcceptButton = _ok;
             CancelButton = _cancel;
@@ -254,6 +309,71 @@ namespace WorkMonitorSwitcher
                 RemovedKeys.Add(_rows[rowIndex].StableKey);
                 _rows.RemoveAt(rowIndex);
             }
+        }
+
+        private void OpenRegistryForSelectedRow()
+        {
+            var rowIndex = _grid.CurrentCell?.RowIndex ?? -1;
+            if (rowIndex < 0 && _grid.SelectedCells.Count > 0)
+                rowIndex = _grid.SelectedCells.Cast<DataGridViewCell>().Min(c => c.RowIndex);
+
+            OpenRegistryForRow(rowIndex);
+        }
+
+        private void OpenRegistryForRow(int rowIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= _rows.Count)
+                return;
+
+            var rawPath = _rows[rowIndex].RegistryKey;
+            if (string.IsNullOrWhiteSpace(rawPath))
+            {
+                MessageBox.Show(this, "This monitor does not have a saved registry key yet.", "Open Registry",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var regeditPath = ToRegeditLastKeyPath(rawPath);
+            if (string.IsNullOrWhiteSpace(regeditPath))
+            {
+                MessageBox.Show(this, $"Unable to open this registry path:\n{rawPath}", "Open Registry",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit"))
+                    key?.SetValue("LastKey", regeditPath, RegistryValueKind.String);
+
+                Process.Start(new ProcessStartInfo("regedit.exe") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Unable to open Registry Editor.\n{ex.Message}", "Open Registry",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private static string ToRegeditLastKeyPath(string rawPath)
+        {
+            var path = rawPath.Trim();
+            const string machinePrefix = @"\Registry\Machine\";
+            const string userPrefix = @"\Registry\User\";
+
+            if (path.StartsWith(machinePrefix, StringComparison.OrdinalIgnoreCase))
+                return @"Computer\HKEY_LOCAL_MACHINE\" + path[machinePrefix.Length..];
+
+            if (path.StartsWith(userPrefix, StringComparison.OrdinalIgnoreCase))
+                return @"Computer\HKEY_USERS\" + path[userPrefix.Length..];
+
+            if (path.StartsWith(@"HKEY_", StringComparison.OrdinalIgnoreCase))
+                return @"Computer\" + path;
+
+            if (path.StartsWith(@"Computer\HKEY_", StringComparison.OrdinalIgnoreCase))
+                return path;
+
+            return string.Empty;
         }
 
         private void ChooseAndOpenCfg()

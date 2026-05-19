@@ -20,11 +20,11 @@
 	  </Content>
 	  <Content Include="MultiMonitorTool.cfg" Condition="Exists('MultiMonitorTool.cfg')">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	    <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+	    <CopyToPublishDirectory>Never</CopyToPublishDirectory>
 	  </Content>
 	  <Content Include="MultiMonitorTool.exe" Condition="Exists('MultiMonitorTool.exe')">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	    <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+	    <CopyToPublishDirectory>Never</CopyToPublishDirectory>
 	  </Content>
 	</ItemGroup>
 

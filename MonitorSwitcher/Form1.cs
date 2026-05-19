@@ -45,18 +45,22 @@ namespace WorkMonitorSwitcher
         private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 800 };
 
         // ---- Layout constants / handles ----
-        private const int SideMargin = 12;
+        private const int SideMargin = 14;
         private const int ControlGapX = 10;
-        private const int ButtonWidth = 120;
+        private const int ButtonWidth = 108;
         private const int ButtonHeight = 30;
-        private const int RowVerticalGap = 80;
-        private const int TopButtonsY = 10;
-        private const int FirstRowY = 60; // fallback start if no HR yet
+        private const int RowPanelWidth = 390;
+        private const int RowPanelHeight = 82;
+        private const int RowVerticalGap = 92;
+        private const int TopButtonsY = 12;
+        private const int FirstRowY = 68; // fallback start if no HR yet
 
         private Button? _btnSettings;
         private Button? _btnRefresh;
         private Button? _btnSaveLayout;
+        private Label? _summaryLabel;
         private Panel? _hrTop;
+        private readonly ToolTip _toolTip = new() { InitialDelay = 350, ReshowDelay = 100, AutoPopDelay = 8000 };
 
         private int _layoutRightMost;
 
@@ -93,7 +97,7 @@ namespace WorkMonitorSwitcher
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
-            MinimumSize = new Size(420, 260); // avoids restore-to-titlebar
+            MinimumSize = new Size(440, 280); // avoids restore-to-titlebar
 
             Directory.CreateDirectory(_appDataDir);
             _layoutPath = Path.Combine(_appDataDir, "monitor-layout.cfg");
@@ -109,15 +113,17 @@ namespace WorkMonitorSwitcher
             foreach (var kv in aliases) _aliasMap[kv.Key] = kv.Value;
 
             // Top buttons
-            _btnSettings = new Button { Text = "Settings", Size = new Size(80, 30) };
+            _btnSettings = new Button { Text = "Settings", Size = new Size(92, 32) };
             _btnSettings.Click += SettingsButton_Click;
             Controls.Add(_btnSettings);
+            _toolTip.SetToolTip(_btnSettings, "Edit aliases, primary monitor, theme, and app tools.");
 
-            _btnRefresh = new Button { Text = "Refresh", Size = new Size(80, 30) };
+            _btnRefresh = new Button { Text = "Refresh", Size = new Size(88, 32) };
             _btnRefresh.Click += (_, __) => RefreshMonitorsAndUi();
             Controls.Add(_btnRefresh);
+            _toolTip.SetToolTip(_btnRefresh, "Detect monitors again.");
 
-            _btnSaveLayout = new Button { Text = "Save", Size = new Size(80, 30) };
+            _btnSaveLayout = new Button { Text = "Save Layout", Size = new Size(106, 32) };
             _btnSaveLayout.Click += (_, __) =>
             {
                 var ok = _layoutSvc.SaveLayout(_layoutPath);
@@ -129,6 +135,15 @@ namespace WorkMonitorSwitcher
                     ThemedMessageBox.Info(this, "Layout saved.", "Save Layout", _uiSettings.DarkMode);
             };
             Controls.Add(_btnSaveLayout);
+            _toolTip.SetToolTip(_btnSaveLayout, "Save the current monitor layout for automatic restore.");
+
+            _summaryLabel = new Label
+            {
+                AutoSize = true,
+                Text = "Detecting monitors...",
+                Font = new Font("Segoe UI", 9, FontStyle.Regular)
+            };
+            Controls.Add(_summaryLabel);
 
             _hrTop = new Panel { Height = 1, BackColor = SystemColors.ControlDark, Visible = true };
             Controls.Add(_hrTop);
@@ -342,10 +357,19 @@ namespace WorkMonitorSwitcher
             x = _btnRefresh.Right + spacing;
 
             _btnSaveLayout.Location = new Point(x, TopButtonsY);
+            x = _btnSaveLayout.Right + spacing;
+
+            if (_summaryLabel != null)
+            {
+                var summarySize = _summaryLabel.PreferredSize;
+                int summaryX = Math.Max(x, ClientSize.Width - SideMargin - summarySize.Width);
+                _summaryLabel.Location = new Point(summaryX, TopButtonsY + Math.Max(0, (_btnSaveLayout.Height - summarySize.Height) / 2));
+            }
 
             _btnSettings.BringToFront();
             _btnRefresh.BringToFront();
             _btnSaveLayout.BringToFront();
+            _summaryLabel?.BringToFront();
 
             UpdateTopSeparator();
         }
@@ -377,6 +401,7 @@ namespace WorkMonitorSwitcher
 
             // Keep HR visible
             if (_hrTop != null) _hrTop.BackColor = palette.Border;
+            if (_summaryLabel != null) _summaryLabel.ForeColor = palette.TextSubtle;
 
             // Native title bar
             DwmInterop.SetDarkTitleBar(this.Handle, dark);
@@ -502,10 +527,13 @@ namespace WorkMonitorSwitcher
             }
 
             // Keep the status aligned over the Enable button (same math used elsewhere)
-            var statusSize = ctrls.StatusLabel.PreferredSize;
-            int statusX = ctrls.EnableButton.Right - statusSize.Width;
-            int statusY = ctrls.TitleLabel.Top + Math.Max(0, (ctrls.TitleLabel.Height - statusSize.Height) / 2);
-            ctrls.StatusLabel.Location = new Point(statusX, statusY);
+            if (ctrls.StatusLabel.AutoSize)
+            {
+                var statusSize = ctrls.StatusLabel.PreferredSize;
+                int statusX = ctrls.EnableButton.Right - statusSize.Width;
+                int statusY = ctrls.TitleLabel.Top + Math.Max(0, (ctrls.TitleLabel.Height - statusSize.Height) / 2);
+                ctrls.StatusLabel.Location = new Point(statusX, statusY);
+            }
 
             ctrls.StatusLabel.Invalidate();
         }
@@ -558,6 +586,7 @@ namespace WorkMonitorSwitcher
             _aliasStore.Save(_aliasMap);
 
             var toShow = BuildPresentationList();
+            UpdateMonitorSummary(toShow);
 
             SuspendLayout();
             try
@@ -578,11 +607,12 @@ namespace WorkMonitorSwitcher
                     y += RowVerticalGap;
                 }
 
-                int desiredWidth = Math.Max(320, _layoutRightMost + SideMargin);
+                int desiredWidth = Math.Max(RowPanelWidth + (SideMargin * 2), _layoutRightMost + SideMargin);
 
                 // Also ensure there’s room for the top buttons row
                 int topButtonsRight = (_btnSaveLayout?.Right ?? 0);
                 desiredWidth = Math.Max(desiredWidth, topButtonsRight + SideMargin);
+                desiredWidth = Math.Max(desiredWidth, (_summaryLabel?.Right ?? 0) + SideMargin);
 
                 int desiredHeight = Math.Max(120, y + SideMargin);
 
@@ -597,6 +627,7 @@ namespace WorkMonitorSwitcher
                 var palette = _uiSettings.DarkMode ? ThemePalette.Dark() : ThemePalette.Light();
                 Themer.Apply(this, palette);
                 if (_hrTop != null) _hrTop.BackColor = palette.Border;
+                if (_summaryLabel != null) _summaryLabel.ForeColor = palette.TextSubtle;
 
 
                 UpdateButtonStatus();
@@ -605,6 +636,19 @@ namespace WorkMonitorSwitcher
             {
                 ResumeLayout(performLayout: true);
             }
+        }
+
+        private void UpdateMonitorSummary(IReadOnlyCollection<DetectedMonitor> monitors)
+        {
+            if (_summaryLabel == null) return;
+
+            int present = monitors.Count(m => m.IsPresent);
+            int active = monitors.Count(m => m.IsPresent && m.IsActive);
+            int savedOnly = monitors.Count - present;
+
+            _summaryLabel.Text = savedOnly > 0
+                ? $"{active}/{present} active - {savedOnly} saved"
+                : $"{active}/{present} active";
         }
 
         private List<DetectedMonitor> BuildPresentationList()
@@ -666,58 +710,87 @@ namespace WorkMonitorSwitcher
 
         private void AddMonitorControls(DetectedMonitor monitor, string friendlyName, int positionY)
         {
-            int labelX = SideMargin;
-            int disableX = SideMargin;
+            var palette = _uiSettings.DarkMode ? ThemePalette.Dark() : ThemePalette.Light();
+
+            var card = new Panel
+            {
+                Location = new Point(SideMargin, positionY),
+                Size = new Size(RowPanelWidth, RowPanelHeight),
+                BackColor = palette.Surface,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            Controls.Add(card);
+            _dynamicControls.Add(card);
+
+            int labelX = 14;
+            int disableX = 14;
             int enableX = disableX + ButtonWidth + ControlGapX;
+            int buttonY = 42;
 
             var label = new Label
             {
                 Text = friendlyName,
-                Location = new Point(labelX, positionY),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 9, FontStyle.Bold)
+                Location = new Point(labelX, 12),
+                AutoSize = false,
+                Size = new Size(245, 22),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                AutoEllipsis = true
             };
-            Controls.Add(label);
-            _dynamicControls.Add(label);
+            card.Controls.Add(label);
+            _toolTip.SetToolTip(label, friendlyName);
 
-            var statusLabel = new Label { AutoSize = true };
-            Controls.Add(statusLabel);
-            _dynamicControls.Add(statusLabel);
+            var statusLabel = new Label
+            {
+                AutoSize = false,
+                Location = new Point(RowPanelWidth - 103, 12),
+                Size = new Size(86, 22),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font("Segoe UI", 8.25f, FontStyle.Bold),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            card.Controls.Add(statusLabel);
+
+            var detail = new Label
+            {
+                Text = BuildMonitorDetailText(monitor),
+                Location = new Point(246, 46),
+                AutoSize = false,
+                Size = new Size(126, 18),
+                AutoEllipsis = true,
+                Font = new Font("Segoe UI", 8.25f, FontStyle.Regular),
+                ForeColor = palette.TextSubtle,
+                TextAlign = ContentAlignment.MiddleRight
+            };
+            card.Controls.Add(detail);
+            _toolTip.SetToolTip(detail, BuildMonitorTooltipText(monitor));
 
             var buttonOff = new Button
             {
-                Text = "DISABLE",
-                Location = new Point(disableX, positionY + 25),
+                Text = "Disable",
+                Location = new Point(disableX, buttonY),
                 Size = new Size(ButtonWidth, ButtonHeight),
                 Tag = monitor.StableKey
             };
             buttonOff.Click += ButtonOff_Click;
-            Controls.Add(buttonOff);
-            _dynamicControls.Add(buttonOff);
+            card.Controls.Add(buttonOff);
+            _toolTip.SetToolTip(buttonOff, "Disable this monitor. At least one display must remain active.");
 
             var buttonOn = new Button
             {
-                Text = "ENABLE",
-                Location = new Point(enableX, positionY + 25),
+                Text = "Enable",
+                Location = new Point(enableX, buttonY),
                 Size = new Size(ButtonWidth, ButtonHeight),
                 Tag = monitor.StableKey
             };
             buttonOn.Click += ButtonOn_Click;
-            Controls.Add(buttonOn);
-            _dynamicControls.Add(buttonOn);
-
-            // status text over the Enable button (right-aligned), vertically aligned with the title label
-            var palette = _uiSettings.DarkMode ? ThemePalette.Dark() : ThemePalette.Light();
+            card.Controls.Add(buttonOn);
+            _toolTip.SetToolTip(buttonOn, "Enable this monitor using the best known monitor identifier.");
 
             statusLabel.Text = monitor.IsPresent ? (monitor.IsActive ? "ONLINE" : "DISABLED") : "OFFLINE";
             statusLabel.ForeColor = monitor.IsPresent ? (monitor.IsActive ? palette.StatusOk : palette.StatusWarn) : palette.TextSubtle;
+            statusLabel.BackColor = palette.Back;
 
-            var statusSize = statusLabel.PreferredSize;
-            int statusX = buttonOn.Right - statusSize.Width;
-            int statusY = label.Top + Math.Max(0, (label.Height - statusSize.Height) / 2);
-            statusLabel.Location = new Point(statusX, statusY);
-
-            _layoutRightMost = Math.Max(_layoutRightMost, Math.Max(buttonOn.Right, statusLabel.Right));
+            _layoutRightMost = Math.Max(_layoutRightMost, card.Right);
 
             _controlsByKey[monitor.StableKey] = new MonitorControls
             {
@@ -726,6 +799,25 @@ namespace WorkMonitorSwitcher
                 StatusLabel = statusLabel,
                 TitleLabel = label
             };
+        }
+
+        private static string BuildMonitorDetailText(DetectedMonitor monitor)
+        {
+            if (!string.IsNullOrWhiteSpace(monitor.DeviceName))
+                return monitor.DeviceName.Replace(@"\\.\", string.Empty);
+            if (!string.IsNullOrWhiteSpace(monitor.Name))
+                return monitor.Name;
+            return monitor.IsPresent ? "Detected" : "Saved";
+        }
+
+        private static string BuildMonitorTooltipText(DetectedMonitor monitor)
+        {
+            var lines = new List<string>();
+            if (!string.IsNullOrWhiteSpace(monitor.DeviceName)) lines.Add($"Device: {monitor.DeviceName}");
+            if (!string.IsNullOrWhiteSpace(monitor.Name)) lines.Add($"Name: {monitor.Name}");
+            if (!string.IsNullOrWhiteSpace(monitor.MonitorKey)) lines.Add($"Registry: {monitor.MonitorKey}");
+            lines.Add($"Stable key: {monitor.StableKey}");
+            return string.Join(Environment.NewLine, lines);
         }
 
         // ---------- Button handlers ----------
@@ -890,10 +982,13 @@ namespace WorkMonitorSwitcher
                     ctrls.DisableButton.ForeColor = palette.TextSubtle;
                     ctrls.EnableButton.ForeColor = palette.TextSubtle;
 
-                    var sizeBusy = ctrls.StatusLabel.PreferredSize;
-                    int sxBusy = ctrls.EnableButton.Right - sizeBusy.Width;
-                    int syBusy = ctrls.TitleLabel.Top + Math.Max(0, (ctrls.TitleLabel.Height - sizeBusy.Height) / 2);
-                    ctrls.StatusLabel.Location = new Point(sxBusy, syBusy);
+                    if (ctrls.StatusLabel.AutoSize)
+                    {
+                        var sizeBusy = ctrls.StatusLabel.PreferredSize;
+                        int sxBusy = ctrls.EnableButton.Right - sizeBusy.Width;
+                        int syBusy = ctrls.TitleLabel.Top + Math.Max(0, (ctrls.TitleLabel.Height - sizeBusy.Height) / 2);
+                        ctrls.StatusLabel.Location = new Point(sxBusy, syBusy);
+                    }
 
                     continue;
                 }
@@ -911,10 +1006,13 @@ namespace WorkMonitorSwitcher
                     ? (isActive ? palette.StatusOk : palette.StatusWarn)
                     : palette.TextSubtle;
 
-                var statusSize = ctrls.StatusLabel.PreferredSize;
-                int statusX = ctrls.EnableButton.Right - statusSize.Width;
-                int statusY = ctrls.TitleLabel.Top + Math.Max(0, (ctrls.TitleLabel.Height - statusSize.Height) / 2);
-                ctrls.StatusLabel.Location = new Point(statusX, statusY);
+                if (ctrls.StatusLabel.AutoSize)
+                {
+                    var statusSize = ctrls.StatusLabel.PreferredSize;
+                    int statusX = ctrls.EnableButton.Right - statusSize.Width;
+                    int statusY = ctrls.TitleLabel.Top + Math.Max(0, (ctrls.TitleLabel.Height - statusSize.Height) / 2);
+                    ctrls.StatusLabel.Location = new Point(statusX, statusY);
+                }
 
                 bool canDisable = isPresent && isActive && activeCount > 1;
                 bool canEnable = !isActive && (hasLast || hasKnownTargets);

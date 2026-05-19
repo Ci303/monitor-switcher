@@ -57,7 +57,7 @@ namespace WorkMonitorSwitcher.Services
             switch (c)
             {
                 case Label lbl:
-                    lbl.BackColor = Color.Transparent;
+                    lbl.BackColor = lbl.BorderStyle == BorderStyle.None ? Color.Transparent : p.Back;
                     // Preserve semantic colors if using our status tokens
                     if (lbl.Text.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
                         lbl.ForeColor = p.StatusOk;
@@ -85,7 +85,7 @@ namespace WorkMonitorSwitcher.Services
                 case Panel pnl:
                     // Let 1px rule lines keep their custom color; other panels follow background
                     if (pnl.Height > 2)
-                        pnl.BackColor = p.Back;
+                        pnl.BackColor = pnl.BorderStyle == BorderStyle.None ? p.Back : p.Surface;
                     break;
 
                 case DataGridView dgv:
@@ -102,6 +102,8 @@ namespace WorkMonitorSwitcher.Services
                     dgv.DefaultCellStyle.ForeColor = p.Text;
                     dgv.DefaultCellStyle.SelectionBackColor = ControlPaint.Light(p.Surface, 0.10f);
                     dgv.DefaultCellStyle.SelectionForeColor = p.Text;
+                    dgv.AlternatingRowsDefaultCellStyle.BackColor = ControlPaint.Light(p.Back, 0.04f);
+                    dgv.AlternatingRowsDefaultCellStyle.ForeColor = p.Text;
 
                     dgv.RowHeadersDefaultCellStyle.BackColor = p.Surface;
                     dgv.RowHeadersDefaultCellStyle.ForeColor = p.Text;
