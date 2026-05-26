@@ -29,6 +29,8 @@ namespace WorkMonitorSwitcher
 
     internal static class SingleInstanceMessenger
     {
+        internal const string ShowExistingWindowEventName = @"Local\WorkMonitorSwitcher.ShowExistingWindowEvent";
+
         private static readonly IntPtr HwndBroadcast = new(0xffff);
 
         internal static readonly int ShowExistingWindowMessage =
@@ -36,6 +38,19 @@ namespace WorkMonitorSwitcher
 
         internal static void NotifyExistingInstance()
         {
+            try
+            {
+                using var signal = new EventWaitHandle(
+                    initialState: false,
+                    mode: EventResetMode.AutoReset,
+                    name: ShowExistingWindowEventName);
+                signal.Set();
+            }
+            catch
+            {
+                // Fall back to the window message below if the event is not available yet.
+            }
+
             if (ShowExistingWindowMessage == 0)
                 return;
 

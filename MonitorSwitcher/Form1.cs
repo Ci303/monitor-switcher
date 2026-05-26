@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -76,6 +77,11 @@ namespace WorkMonitorSwitcher
         private readonly HashSet<string> _busy = new(StringComparer.OrdinalIgnoreCase);
         private bool _exitRequested;
         private bool _restoringFromTray;
+        private bool _isRefreshingUi;
+        private bool _refreshAgainAfterCurrent;
+        private System.Windows.Forms.Timer? _restoreRefreshTimer;
+        private EventWaitHandle? _showExistingWindowEvent;
+        private RegisteredWaitHandle? _showExistingWindowWait;
 
         // Restore robustness
         private bool _deferredLayout; // schedule a full rebuild after restore/show
@@ -184,6 +190,7 @@ namespace WorkMonitorSwitcher
             Controls.Add(_missingToolPanel);
 
             SetupTrayIcon();
+            SetupSingleInstanceRestoreSignal();
 
             _hrTop = new Panel { Height = 1, BackColor = SystemColors.ControlDark, Visible = true };
             Controls.Add(_hrTop);
@@ -262,22 +269,15 @@ namespace WorkMonitorSwitcher
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            _showExistingWindowWait?.Unregister(null);
+            _showExistingWindowEvent?.Dispose();
+            _restoreRefreshTimer?.Stop();
+            _restoreRefreshTimer?.Dispose();
             _trayIcon?.Dispose();
             _trayMenu?.Dispose();
             base.OnFormClosed(e);
         }
 
-        // Composited painting for children (extra flicker reduction)
-        protected override CreateParams CreateParams
-        {
-            get
-            {
-                const int WS_EX_COMPOSITED = 0x02000000;
-                var cp = base.CreateParams;
-                cp.ExStyle |= WS_EX_COMPOSITED;
-                return cp;
-            }
-        }
         protected override void OnPaintBackground(PaintEventArgs e)
         {
             // Explicitly clear the entire client area to our BackColor to avoid dark-mode “black box” artifacts
@@ -531,6 +531,33 @@ namespace WorkMonitorSwitcher
             _trayIcon.DoubleClick += (_, __) => RestoreFromTray();
         }
 
+        private void SetupSingleInstanceRestoreSignal()
+        {
+            try
+            {
+                _showExistingWindowEvent = new EventWaitHandle(
+                    initialState: false,
+                    mode: EventResetMode.AutoReset,
+                    name: SingleInstanceMessenger.ShowExistingWindowEventName);
+
+                _showExistingWindowWait = ThreadPool.RegisterWaitForSingleObject(
+                    _showExistingWindowEvent,
+                    (_, __) =>
+                    {
+                        if (IsDisposed) return;
+                        try { BeginInvoke(new Action(ShowMainWindowForInteraction)); }
+                        catch { /* ignore shutdown races */ }
+                    },
+                    state: null,
+                    millisecondsTimeOutInterval: -1,
+                    executeOnlyOnce: false);
+            }
+            catch
+            {
+                // The window-message fallback still handles normal visible-window activation.
+            }
+        }
+
         private void HideToTray()
         {
             SaveWindowBounds();
@@ -557,6 +584,28 @@ namespace WorkMonitorSwitcher
             Show();
             Activate();
 
+            QueueRestoreRefresh();
+        }
+
+        private void QueueRestoreRefresh()
+        {
+            _restoreRefreshTimer?.Stop();
+            _restoreRefreshTimer?.Dispose();
+
+            _restoreRefreshTimer = new System.Windows.Forms.Timer { Interval = 350 };
+            _restoreRefreshTimer.Tick += (_, __) =>
+            {
+                _restoreRefreshTimer?.Stop();
+                _restoreRefreshTimer?.Dispose();
+                _restoreRefreshTimer = null;
+
+                CompleteRestoreFromTray();
+            };
+            _restoreRefreshTimer.Start();
+        }
+
+        private void CompleteRestoreFromTray()
+        {
             try
             {
                 BeginInvoke(new Action(() =>
@@ -567,6 +616,7 @@ namespace WorkMonitorSwitcher
                         _deferredLayout = false;
                         RefreshMonitorsAndUi();
                         LeftTopButtons();
+                        EnsureDynamicRowsVisible();
                         Invalidate(true);
                         Update();
                     }
@@ -875,8 +925,38 @@ namespace WorkMonitorSwitcher
 
         private void RefreshMonitorsAndUi()
         {
+            if (_isRefreshingUi)
+            {
+                _refreshAgainAfterCurrent = true;
+                return;
+            }
+
+            _isRefreshingUi = true;
+            try
+            {
+                do
+                {
+                    _refreshAgainAfterCurrent = false;
+                    RefreshMonitorsAndUiCore();
+                }
+                while (_refreshAgainAfterCurrent && !IsDisposed);
+            }
+            finally
+            {
+                _isRefreshingUi = false;
+            }
+        }
+
+        private void RefreshMonitorsAndUiCore()
+        {
             LeftTopButtons();
             UpdateTopSeparator();
+
+            if (!IsNormalVisible)
+            {
+                _deferredLayout = true;
+                return;
+            }
 
             _detected = _detectSvc.Detect();
 
@@ -971,12 +1051,63 @@ namespace WorkMonitorSwitcher
 
 
                 UpdateButtonStatus();
+                EnsureDynamicRowsVisible();
             }
             finally
             {
                 ResumeLayout(performLayout: true);
             }
         }
+
+        private void EnsureDynamicRowsVisible()
+        {
+            if (_dynamicControls.Count == 0)
+                return;
+
+            foreach (var control in _dynamicControls.Where(c => !c.IsDisposed))
+            {
+                control.Visible = true;
+                EnsureControlTreeCreated(control);
+                control.BringToFront();
+                control.Invalidate(true);
+                ForceRedraw(control);
+            }
+
+            _summaryLabel?.BringToFront();
+            _btnSettings?.BringToFront();
+            _btnRefresh?.BringToFront();
+            _btnSaveLayout?.BringToFront();
+            _btnRestoreLayout?.BringToFront();
+            _hrTop?.BringToFront();
+
+            ForceRedraw(this);
+        }
+
+        private static void EnsureControlTreeCreated(Control control)
+        {
+            control.CreateControl();
+            foreach (Control child in control.Controls)
+                EnsureControlTreeCreated(child);
+        }
+
+        private static void ForceRedraw(Control control)
+        {
+            if (!control.IsHandleCreated) return;
+
+            const int RDW_INVALIDATE = 0x0001;
+            const int RDW_ERASE = 0x0004;
+            const int RDW_ALLCHILDREN = 0x0080;
+            const int RDW_UPDATENOW = 0x0100;
+
+            RedrawWindow(
+                control.Handle,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, int flags);
 
         private void UpdateMonitorSummary(IReadOnlyCollection<DetectedMonitor> monitors)
         {

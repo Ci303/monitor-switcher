@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.3.2 - 2026-05-26
+
+### Fixed
+
+- Fixed an intermittent tray-restore repaint issue where the main window could reopen with the toolbar and status text visible but the monitor rows blank.
+
 ## v0.3.1 - 2026-05-19
 
 ### Added
