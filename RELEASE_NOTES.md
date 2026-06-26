@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.3.4 - 2026-06-26
+
+### Added
+
+- Added a per-monitor fallback primary setting used when disabling the current primary monitor.
+
+### Improved
+
+- Settings now opens at a content-aware size so the grid, details pane, and action buttons fit without manual resizing.
+- Preferred primary is now re-applied after monitor enable and layout restore so saved-layout restoration cannot leave another monitor primary.
+- Reduced duplication in settings and enable-monitor orchestration code.
+
 ## v0.3.3 - 2026-06-26
 
 ### Fixed

@@ -104,6 +104,12 @@ namespace WorkMonitorSwitcher
             public string ErrorMessage { get; init; } = string.Empty;
         }
 
+        private sealed class EnableAttemptResult
+        {
+            public bool Success { get; init; }
+            public ToolResult? LastResult { get; init; }
+        }
+
         public Form1()
         {
             // Reduce flicker
@@ -345,33 +351,55 @@ namespace WorkMonitorSwitcher
 
         // Choose a safe fallback active screen to host the window,
         // excluding the screen identified by excludeDevice (the one we’re about to disable).
-        // Prefers the left-most active screen; falls back to Primary; then any.
+        // Prefers the configured fallback primary, then the left-most active screen.
         private Screen GetFallbackActiveScreen(string? excludeDevice)
         {
-            // 1) Active detected monitors mapped to Screen
+            var configuredFallback = TryGetConfiguredFallbackPrimaryScreen(excludeDevice);
+            if (configuredFallback != null)
+                return configuredFallback;
+
             var activeDevices = _detected
                 .Where(d => d.IsPresent && d.IsActive)
+                .Where(d => !string.IsNullOrWhiteSpace(d.DeviceName) &&
+                            !string.Equals(d.DeviceName, excludeDevice, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(d => d.PositionX)
+                .ThenBy(d => d.DeviceName, StringComparer.OrdinalIgnoreCase)
                 .Select(d => d.DeviceName)
-                .Where(dn => !string.IsNullOrWhiteSpace(dn) &&
-                             !string.Equals(dn, excludeDevice, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
-            foreach (var dev in activeDevices.OrderBy(d => d, StringComparer.OrdinalIgnoreCase))
+            foreach (var dev in activeDevices)
             {
                 var scr = TryGetScreenForDevice(dev);
                 if (scr != null) return scr;
             }
 
-            // 2) Primary screen, unless it’s the excluded one
             var primary = Screen.PrimaryScreen;
             if (primary != null &&
                 !string.Equals(primary.DeviceName, excludeDevice, StringComparison.OrdinalIgnoreCase))
                 return primary;
 
-            // 3) Any other screen not excluded
             var any = Screen.AllScreens.FirstOrDefault(s =>
                 !string.Equals(s.DeviceName, excludeDevice, StringComparison.OrdinalIgnoreCase));
             return any ?? (primary ?? Screen.AllScreens.First());
+        }
+
+        private Screen? TryGetConfiguredFallbackPrimaryScreen(string? excludeDevice)
+        {
+            var fallback = _aliasMap.FirstOrDefault(kv => kv.Value.IsFallbackPrimary);
+            if (string.IsNullOrWhiteSpace(fallback.Key))
+                return null;
+
+            var live = _detected.FirstOrDefault(d =>
+                d.StableKey.Equals(fallback.Key, StringComparison.OrdinalIgnoreCase) &&
+                d.IsPresent &&
+                d.IsActive &&
+                !string.IsNullOrWhiteSpace(d.DeviceName) &&
+                !string.Equals(d.DeviceName, excludeDevice, StringComparison.OrdinalIgnoreCase));
+
+            if (live == null)
+                return null;
+
+            return TryGetScreenForDevice(live.DeviceName);
         }
         // Center this window on the given screen's working area.
         // Temporarily drops TopMost to avoid z-order oddities while moving.
@@ -741,6 +769,11 @@ namespace WorkMonitorSwitcher
             await Task.Delay(800);
             await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
             RefreshMonitorsAndUi();
+            if (EnforcePreferredPrimaryIfActive("preferred primary after layout restore"))
+            {
+                await Task.Delay(400);
+                RefreshMonitorsAndUi();
+            }
 
             if (showMessage)
                 ThemedMessageBox.Info(this, $"Layout profile '{profile}' restored.", "Restore Layout", _uiSettings.DarkMode);
@@ -813,31 +846,8 @@ namespace WorkMonitorSwitcher
             if (!Visible || WindowState == FormWindowState.Minimized || !ShowInTaskbar)
                 ShowMainWindowForInteraction();
 
-            var rows = BuildPresentationList()
-                .Select(d =>
-                {
-                    var alias = GetAliasFor(d.StableKey);
-                    _aliasMap.TryGetValue(d.StableKey, out var mi);
-                    var reg = mi?.LastRegistryKey ?? string.Empty;
-                    return new AliasViewRow
-                    {
-                        StableKey = d.StableKey,
-                        ShortKey = d.StableKey.Length <= 28 ? d.StableKey : "…" + d.StableKey[^28..],
-                        Alias = alias,
-                        RegistryKey = reg,
-                        IsPreferredPrimary = (mi?.IsPreferredPrimary ?? false),
-                        DeviceName = d.DeviceName,
-                        MonitorName = d.Name,
-                        MonitorId = d.MonitorId,
-                        InstanceId = d.InstanceId,
-                        SerialNumber = d.SerialNumber,
-                        KnownTargets = mi == null ? string.Empty : string.Join(", ", mi.KnownTargets)
-                    };
-                })
-                .ToList();
-
             using var dlg = new AliasSettingsForm(
-                rows,
+                BuildAliasSettingsRows(),
                 _uiSettings.DarkMode,
                 _uiSettings.AlwaysOnTop,
                 _uiSettings.MinimizeToTray,
@@ -846,7 +856,8 @@ namespace WorkMonitorSwitcher
                 Path.Combine(AppContext.BaseDirectory, "MultiMonitorTool.cfg"),
                 _profileStore.LoadProfileNames(),
                 SelectedLayoutProfileName(),
-                _log.Read())
+                _log.Read(),
+                this)
             {
                 StartPosition = FormStartPosition.CenterParent,
                 ShowInTaskbar = false,
@@ -870,69 +881,91 @@ namespace WorkMonitorSwitcher
             }
 
             if (dr == DialogResult.OK)
+                ApplySettingsDialogResults(dlg);
+        }
+
+        private List<AliasViewRow> BuildAliasSettingsRows()
+            => BuildPresentationList()
+                .Select(d =>
+                {
+                    var alias = GetAliasFor(d.StableKey);
+                    _aliasMap.TryGetValue(d.StableKey, out var mi);
+                    return new AliasViewRow
+                    {
+                        StableKey = d.StableKey,
+                        ShortKey = d.StableKey.Length <= 28 ? d.StableKey : "…" + d.StableKey[^28..],
+                        Alias = alias,
+                        RegistryKey = mi?.LastRegistryKey ?? string.Empty,
+                        IsPreferredPrimary = mi?.IsPreferredPrimary ?? false,
+                        IsFallbackPrimary = mi?.IsFallbackPrimary ?? false,
+                        DeviceName = d.DeviceName,
+                        MonitorName = d.Name,
+                        MonitorId = d.MonitorId,
+                        InstanceId = d.InstanceId,
+                        SerialNumber = d.SerialNumber,
+                        KnownTargets = mi == null ? string.Empty : string.Join(", ", mi.KnownTargets)
+                    };
+                })
+                .ToList();
+
+        private void ApplySettingsDialogResults(AliasSettingsForm dlg)
+        {
+            foreach (var removedKey in dlg.RemovedKeys)
+                _aliasMap.Remove(removedKey);
+
+            foreach (var kvp in dlg.UpdatedMappings)
             {
-                foreach (var removedKey in dlg.RemovedKeys)
-                    _aliasMap.Remove(removedKey);
-
-                // Aliases
-                foreach (var kvp in dlg.UpdatedMappings)
-                {
-                    if (!_aliasMap.TryGetValue(kvp.Key, out var info))
-                        info = new MonitorInfo();
-                    info.Name = kvp.Value ?? info.Name;
-                    _aliasMap[kvp.Key] = info;
-                }
-
-                // Preferred primary (single selection)
-                foreach (var kv in _aliasMap.Keys.ToList())
-                {
-                    var info = _aliasMap[kv];
-                    info.IsPreferredPrimary = string.Equals(kv, dlg.PreferredPrimaryKey, StringComparison.OrdinalIgnoreCase);
-                    _aliasMap[kv] = info;
-                }
-
-                _aliasStore.Save(_aliasMap);
-
-                // Dark mode
-                if (dlg.DarkModeResult.HasValue && dlg.DarkModeResult.Value != _uiSettings.DarkMode)
-                {
-                    _uiSettings.DarkMode = dlg.DarkModeResult.Value;
-                    _uiStore.Save(_uiSettings);
-                    ApplyTheme(_uiSettings.DarkMode);
-                }
-
-                // Always on top
-                if (dlg.AlwaysOnTopResult.HasValue && dlg.AlwaysOnTopResult.Value != _uiSettings.AlwaysOnTop)
-                {
-                    _uiSettings.AlwaysOnTop = dlg.AlwaysOnTopResult.Value;
-                    _uiStore.Save(_uiSettings);
-                    TopMost = _uiSettings.AlwaysOnTop;
-                }
-
-                if (dlg.MinimizeToTrayResult.HasValue)
-                    _uiSettings.MinimizeToTray = dlg.MinimizeToTrayResult.Value;
-
-                if (dlg.StartWithWindowsResult.HasValue)
-                {
-                    _uiSettings.StartWithWindows = dlg.StartWithWindowsResult.Value;
-                    StartupManager.SetEnabled(_uiSettings.StartWithWindows, Application.ExecutablePath);
-                }
-
-                if (dlg.ConfirmBeforeDisableResult.HasValue)
-                    _uiSettings.ConfirmBeforeDisable = dlg.ConfirmBeforeDisableResult.Value;
-
-                if (!string.IsNullOrWhiteSpace(dlg.SelectedLayoutProfileResult))
-                {
-                    _uiSettings.SelectedLayoutProfile = dlg.SelectedLayoutProfileResult;
-                }
-
-                foreach (var profile in dlg.RemovedLayoutProfiles)
-                    _profileStore.DeleteProfile(profile);
-
-                _uiStore.Save(_uiSettings);
-
-                RefreshMonitorsAndUi();
+                if (!_aliasMap.TryGetValue(kvp.Key, out var info))
+                    info = new MonitorInfo();
+                info.Name = kvp.Value ?? info.Name;
+                _aliasMap[kvp.Key] = info;
             }
+
+            foreach (var kv in _aliasMap.Keys.ToList())
+            {
+                var info = _aliasMap[kv];
+                info.IsPreferredPrimary = string.Equals(kv, dlg.PreferredPrimaryKey, StringComparison.OrdinalIgnoreCase);
+                info.IsFallbackPrimary = string.Equals(kv, dlg.FallbackPrimaryKey, StringComparison.OrdinalIgnoreCase);
+                _aliasMap[kv] = info;
+            }
+
+            _aliasStore.Save(_aliasMap);
+
+            if (dlg.DarkModeResult.HasValue && dlg.DarkModeResult.Value != _uiSettings.DarkMode)
+            {
+                _uiSettings.DarkMode = dlg.DarkModeResult.Value;
+                _uiStore.Save(_uiSettings);
+                ApplyTheme(_uiSettings.DarkMode);
+            }
+
+            if (dlg.AlwaysOnTopResult.HasValue && dlg.AlwaysOnTopResult.Value != _uiSettings.AlwaysOnTop)
+            {
+                _uiSettings.AlwaysOnTop = dlg.AlwaysOnTopResult.Value;
+                _uiStore.Save(_uiSettings);
+                TopMost = _uiSettings.AlwaysOnTop;
+            }
+
+            if (dlg.MinimizeToTrayResult.HasValue)
+                _uiSettings.MinimizeToTray = dlg.MinimizeToTrayResult.Value;
+
+            if (dlg.StartWithWindowsResult.HasValue)
+            {
+                _uiSettings.StartWithWindows = dlg.StartWithWindowsResult.Value;
+                StartupManager.SetEnabled(_uiSettings.StartWithWindows, Application.ExecutablePath);
+            }
+
+            if (dlg.ConfirmBeforeDisableResult.HasValue)
+                _uiSettings.ConfirmBeforeDisable = dlg.ConfirmBeforeDisableResult.Value;
+
+            if (!string.IsNullOrWhiteSpace(dlg.SelectedLayoutProfileResult))
+                _uiSettings.SelectedLayoutProfile = dlg.SelectedLayoutProfileResult;
+
+            foreach (var profile in dlg.RemovedLayoutProfiles)
+                _profileStore.DeleteProfile(profile);
+
+            _uiStore.Save(_uiSettings);
+
+            RefreshMonitorsAndUi();
         }
 
         // ---------- Working change ----------
@@ -1457,8 +1490,31 @@ namespace WorkMonitorSwitcher
             SetRowBusy(stableKey, true);
             UpdateButtonStatus();
 
+            var attempt = await TryEnableMonitorTargetsAsync(stableKey, enableTargets);
+
+            // Clear busy
+            SetRowBusy(stableKey, false);
+
+            if (!attempt.Success)
+            {
+                LogMonitorAction($"ENABLE {stableKey}: all target attempts failed.");
+                ThemedMessageBox.Error(this,
+                    $"Enable failed to activate the selected monitor." +
+                    (attempt.LastResult == null ? string.Empty : $" (last exit {attempt.LastResult.ExitCode}).") +
+                    (string.IsNullOrWhiteSpace(attempt.LastResult?.StdErr) ? string.Empty : $"\n{attempt.LastResult!.StdErr}"),
+                    "Monitor Switcher", _uiSettings.DarkMode);
+
+                RefreshMonitorsAndUi();
+                return;
+            }
+
+            await FinaliseSuccessfulEnableAsync();
+        }
+
+        private async Task<EnableAttemptResult> TryEnableMonitorTargetsAsync(string stableKey, List<string> enableTargets)
+        {
             ToolResult? last = null;
-            bool enabledTarget = false;
+
             for (int i = 0; i < enableTargets.Count; i++)
             {
                 var target = enableTargets[i];
@@ -1471,43 +1527,35 @@ namespace WorkMonitorSwitcher
                 if (MonitorTargetResolver.IsStableKeyActive(detectedNow, stableKey))
                 {
                     LogMonitorAction($"ENABLE {stableKey}: activation confirmed after target '{target}'.");
-                    enabledTarget = true;
-                    break;
+                    return new EnableAttemptResult { Success = true, LastResult = last };
                 }
 
-                foreach (var nextTarget in MonitorTargetResolver.ResolveEnableTargetArgs(stableKey, detectedNow, _aliasMap))
-                {
-                    if (enableTargets.Any(existing => MonitorTargetResolver.TargetsEquivalent(existing, nextTarget)))
-                        continue;
-
-                    enableTargets.Add(nextTarget);
-                    _log.Write($"Enable candidate added for '{GetAliasFor(stableKey)}' after re-detect: '{nextTarget}'.");
-                }
-
+                AddEnableCandidatesFromDetection(stableKey, enableTargets, detectedNow);
                 LogMonitorAction($"ENABLE {stableKey}: target '{target}' did not activate requested stable key.");
             }
 
-            // Clear busy
-            SetRowBusy(stableKey, false);
+            return new EnableAttemptResult { Success = false, LastResult = last };
+        }
 
-            if (!enabledTarget)
+        private void AddEnableCandidatesFromDetection(
+            string stableKey,
+            List<string> enableTargets,
+            IReadOnlyCollection<DetectedMonitor> detectedNow)
+        {
+            foreach (var nextTarget in MonitorTargetResolver.ResolveEnableTargetArgs(stableKey, detectedNow, _aliasMap))
             {
-                LogMonitorAction($"ENABLE {stableKey}: all target attempts failed.");
-                ThemedMessageBox.Error(this,
-                    $"Enable failed to activate the selected monitor." +
-                    (last == null ? string.Empty : $" (last exit {last.ExitCode}).") +
-                    (string.IsNullOrWhiteSpace(last?.StdErr) ? string.Empty : $"\n{last!.StdErr}"),
-                    "Monitor Switcher", _uiSettings.DarkMode);
+                if (enableTargets.Any(existing => MonitorTargetResolver.TargetsEquivalent(existing, nextTarget)))
+                    continue;
 
-                RefreshMonitorsAndUi();
-                return;
+                enableTargets.Add(nextTarget);
+                _log.Write($"Enable candidate added for '{GetAliasFor(stableKey)}' after re-detect: '{nextTarget}'.");
             }
+        }
 
-            // Success path mirrors your previous logic
+        private async Task FinaliseSuccessfulEnableAsync()
+        {
             RefreshMonitorsAndUi();
-            EnforcePrimaryMonitorOrder();
-
-            // If all are now active, restore saved layout
+            bool restoredLayout = false;
             if (_detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive))
             {
                 var profile = SelectedLayoutProfileName();
@@ -1522,9 +1570,20 @@ namespace WorkMonitorSwitcher
                     _log.Write($"Auto-restored layout profile '{profile}' after all monitors became active.");
                     await Task.Delay(800);
                     await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
+                    restoredLayout = true;
                 }
 
                 RefreshMonitorsAndUi();
+            }
+
+            if (EnforcePreferredPrimaryIfActive("preferred primary after enable"))
+            {
+                await Task.Delay(400);
+                RefreshMonitorsAndUi();
+            }
+            else if (!restoredLayout)
+            {
+                EnforcePrimaryMonitorOrder(allowAutomaticFallback: true);
             }
         }
 
@@ -1616,24 +1675,13 @@ namespace WorkMonitorSwitcher
         }
 
 
-        private void EnforcePrimaryMonitorOrder()
+        private void EnforcePrimaryMonitorOrder(bool allowAutomaticFallback)
         {
-            // Prefer the user's selected Preferred Primary; else left-most active
-            var primary = _aliasMap.FirstOrDefault(kv => kv.Value.IsPreferredPrimary);
-            if (!string.IsNullOrEmpty(primary.Key))
-            {
-                var m = _detected.FirstOrDefault(d => d.IsPresent && d.IsActive &&
-                                                      d.StableKey.Equals(primary.Key, StringComparison.OrdinalIgnoreCase));
-                if (m != null)
-                {
-                    var target = MonitorTargetResolver.ResolveTargetArg(primary.Key, _detected, _aliasMap);
-                    if (!string.IsNullOrWhiteSpace(target))
-                    {
-                        SetPrimaryWithTopologyFallback(target, "preferred primary");
-                        return;
-                    }
-                }
-            }
+            if (EnforcePreferredPrimaryIfActive("preferred primary"))
+                return;
+
+            if (!allowAutomaticFallback)
+                return;
 
             var firstActive = _detected.Where(d => d.IsPresent && d.IsActive)
                                        .OrderBy(d => d.PositionX)
@@ -1644,6 +1692,27 @@ namespace WorkMonitorSwitcher
                 if (!string.IsNullOrWhiteSpace(target))
                     SetPrimaryWithTopologyFallback(target, "left-most active primary");
             }
+        }
+
+        private bool EnforcePreferredPrimaryIfActive(string reason)
+        {
+            var primary = _aliasMap.FirstOrDefault(kv => kv.Value.IsPreferredPrimary);
+            if (string.IsNullOrWhiteSpace(primary.Key))
+                return false;
+
+            var activePrimary = _detected.FirstOrDefault(d =>
+                d.IsPresent &&
+                d.IsActive &&
+                d.StableKey.Equals(primary.Key, StringComparison.OrdinalIgnoreCase));
+            if (activePrimary == null)
+                return false;
+
+            var target = MonitorTargetResolver.ResolveTargetArg(primary.Key, _detected, _aliasMap);
+            if (string.IsNullOrWhiteSpace(target))
+                return false;
+
+            SetPrimaryWithTopologyFallback(target, reason);
+            return true;
         }
 
         private void SetPrimaryWithTopologyFallback(string target, string reason)
@@ -1789,6 +1858,8 @@ namespace WorkMonitorSwitcher
                 MergeMonitorInfo(target, source, live.StableKey);
                 if (source.IsPreferredPrimary)
                     EnsureOnlyPreferredPrimary(live.StableKey);
+                if (source.IsFallbackPrimary)
+                    EnsureOnlyFallbackPrimary(live.StableKey);
 
                 _aliasMap.Remove(staleKey);
                 _log.Write($"Removed stale saved display key '{staleKey}' because '{live.StableKey}' is present on {live.DeviceName}.");
@@ -1900,6 +1971,8 @@ namespace WorkMonitorSwitcher
 
             if (source.IsPreferredPrimary)
                 target.IsPreferredPrimary = true;
+            if (source.IsFallbackPrimary)
+                target.IsFallbackPrimary = true;
 
             if (!target.PreferredOrder.HasValue && source.PreferredOrder.HasValue)
                 target.PreferredOrder = source.PreferredOrder;
@@ -1942,6 +2015,16 @@ namespace WorkMonitorSwitcher
             {
                 var info = _aliasMap[key];
                 info.IsPreferredPrimary = key.Equals(stableKey, StringComparison.OrdinalIgnoreCase);
+                _aliasMap[key] = info;
+            }
+        }
+
+        private void EnsureOnlyFallbackPrimary(string stableKey)
+        {
+            foreach (var key in _aliasMap.Keys.ToList())
+            {
+                var info = _aliasMap[key];
+                info.IsFallbackPrimary = key.Equals(stableKey, StringComparison.OrdinalIgnoreCase);
                 _aliasMap[key] = info;
             }
         }

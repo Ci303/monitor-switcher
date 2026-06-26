@@ -35,12 +35,15 @@ namespace WorkMonitorSwitcher.Model
         public int? PreferredOrder { get; set; }           // Optional pin for row ordering
         public int? LastKnownX { get; set; }               // Last known X position (for sorting)
 
-        // NEW: known command targets we can try with MultiMonitorTool
+        // Known command targets we can try with MultiMonitorTool
         // e.g., "\"\\\\.\\DISPLAY2\"", "\"Generic PnP Monitor\""
         public List<string> KnownTargets { get; set; } = new List<string>();
 
-        // NEW: user can mark this alias as the preferred primary monitor
+        // User can mark this alias as the preferred primary monitor
         public bool IsPreferredPrimary { get; set; }
+
+        // User can mark this alias as the preferred fallback when disabling the current primary
+        public bool IsFallbackPrimary { get; set; }
     }
 
     // A detected (or reconstructed) monitor instance used by the app
@@ -67,6 +70,7 @@ namespace WorkMonitorSwitcher.Model
         public string RegistryKeyShort => ShortenRegistryKey(RegistryKey);
         public string? Alias { get; set; }                      // Editable alias
         public bool IsPreferredPrimary { get; set; }
+        public bool IsFallbackPrimary { get; set; }
         public string DeviceName { get; set; } = string.Empty;
         public string MonitorName { get; set; } = string.Empty;
         public string MonitorId { get; set; } = string.Empty;

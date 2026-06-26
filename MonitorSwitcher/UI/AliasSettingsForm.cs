@@ -67,6 +67,7 @@ namespace WorkMonitorSwitcher
         public HashSet<string> RemovedKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
         public bool? DarkModeResult { get; private set; }
         public string? PreferredPrimaryKey { get; private set; }
+        public string? FallbackPrimaryKey { get; private set; }
         public bool? AlwaysOnTopResult { get; private set; }
         public bool? MinimizeToTrayResult { get; private set; }
         public bool? StartWithWindowsResult { get; private set; }
@@ -84,7 +85,8 @@ namespace WorkMonitorSwitcher
             string cfgPath,
             List<string> layoutProfiles,
             string selectedLayoutProfile,
-            string diagnosticsText)
+            string diagnosticsText,
+            Form? sizingOwner = null)
 
         {
             _rows = new BindingList<AliasViewRow>(current);
@@ -119,7 +121,7 @@ namespace WorkMonitorSwitcher
                 // Non-fatal: the dialog can still open without a title bar icon.
             }
             MinimumSize = new Size(920, 430);
-            Size = new Size(980, 600);
+            Size = new Size(1120, 660);
             _chkDark.Checked = darkMode;
             _chkTopMost.Checked = alwaysOnTop;
             _chkTray.Checked = minimizeToTray;
@@ -132,6 +134,8 @@ namespace WorkMonitorSwitcher
             _grid.ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText;
             _grid.BorderStyle = BorderStyle.None;
             _grid.RowTemplate.Height = 28;
+            _grid.MinimumSize = new Size(700, 0);
+            _details.MinimumSize = new Size(320, 0);
 
             // Columns
             var shortKeyCol = new DataGridViewTextBoxColumn
@@ -169,10 +173,21 @@ namespace WorkMonitorSwitcher
             };
 
             primaryCol.ThreeState = false;
+            var fallbackPrimaryCol = new DataGridViewCheckBoxColumn
+            {
+                HeaderText = "Fallback",
+                DataPropertyName = nameof(AliasViewRow.IsFallbackPrimary),
+                ReadOnly = false,
+                FillWeight = 10,
+                MinimumWidth = 76
+            };
+            fallbackPrimaryCol.ThreeState = false;
+
             _grid.Columns.Add(shortKeyCol);
             _grid.Columns.Add(regCol);
             _grid.Columns.Add(aliasCol);
             _grid.Columns.Add(primaryCol);
+            _grid.Columns.Add(fallbackPrimaryCol);
             _grid.DataSource = _rows;
             _grid.EditMode = DataGridViewEditMode.EditOnEnter;
             _grid.CurrentCellDirtyStateChanged += (s, e) =>
@@ -216,20 +231,23 @@ namespace WorkMonitorSwitcher
             {
                 if (e.RowIndex < 0) return;
 
-                // Only react to changes in the Primary column
-                if (_grid.Columns[e.ColumnIndex] is DataGridViewCheckBoxColumn &&
-                    _grid.Columns[e.ColumnIndex].DataPropertyName == nameof(AliasViewRow.IsPreferredPrimary))
-                {
-                    // Ensure single-select: if the clicked row is now true, set all others false
-                    bool selected = _rows[e.RowIndex].IsPreferredPrimary;
-                    if (selected)
-                    {
-                        for (int i = 0; i < _rows.Count; i++)
-                            if (i != e.RowIndex && _rows[i].IsPreferredPrimary)
-                                _rows[i].IsPreferredPrimary = false;
+                if (_grid.Columns[e.ColumnIndex] is not DataGridViewCheckBoxColumn)
+                    return;
 
-                        _grid.Invalidate(); // repaint checkboxes
-                    }
+                var propertyName = _grid.Columns[e.ColumnIndex].DataPropertyName;
+                if (propertyName == nameof(AliasViewRow.IsPreferredPrimary))
+                {
+                    KeepSingleCheckedRow(
+                        e.RowIndex,
+                        row => row.IsPreferredPrimary,
+                        (row, value) => row.IsPreferredPrimary = value);
+                }
+                else if (propertyName == nameof(AliasViewRow.IsFallbackPrimary))
+                {
+                    KeepSingleCheckedRow(
+                        e.RowIndex,
+                        row => row.IsFallbackPrimary,
+                        (row, value) => row.IsFallbackPrimary = value);
                 }
             };
             _grid.CellDoubleClick += (_, e) =>
@@ -268,7 +286,9 @@ namespace WorkMonitorSwitcher
                 Height = 44,
                 FlowDirection = FlowDirection.LeftToRight,
                 Padding = new Padding(12, 10, 12, 6),
-                AutoSize = false
+                AutoSize = false,
+                WrapContents = false,
+                AutoScroll = true
             };
             _chkDark.Margin = new Padding(0, 3, 18, 3);
             _chkTopMost.Margin = new Padding(0, 3, 18, 3);
@@ -287,7 +307,8 @@ namespace WorkMonitorSwitcher
                 Height = 42,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = false,
-                Padding = new Padding(12, 7, 12, 5)
+                Padding = new Padding(12, 7, 12, 5),
+                AutoScroll = true
             };
             var profileLabel = new Label
             {
@@ -317,7 +338,8 @@ namespace WorkMonitorSwitcher
                 Dock = DockStyle.Fill,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = false,
-                AutoSize = true
+                AutoSize = true,
+                AutoScroll = true
             };
             var commitActions = new FlowLayoutPanel
             {
@@ -357,6 +379,7 @@ namespace WorkMonitorSwitcher
             Controls.Add(topBar);
             Controls.Add(profileBar);
             Controls.Add(bottom);
+            FitInitialSizeToContent(topBar, profileBar, toolActions, commitActions, sizingOwner);
 
             AcceptButton = _ok;
             CancelButton = _cancel;
@@ -375,6 +398,7 @@ namespace WorkMonitorSwitcher
 
                 DarkModeResult = _chkDark.Checked;
                 PreferredPrimaryKey = _rows.FirstOrDefault(r => r.IsPreferredPrimary)?.StableKey;
+                FallbackPrimaryKey = _rows.FirstOrDefault(r => r.IsFallbackPrimary)?.StableKey;
                 AlwaysOnTopResult = _chkTopMost.Checked;
                 MinimizeToTrayResult = _chkTray.Checked;
                 StartWithWindowsResult = _chkStartup.Checked;
@@ -385,6 +409,85 @@ namespace WorkMonitorSwitcher
             };
 
             UpdateDetailsPanel();
+        }
+
+        private void FitInitialSizeToContent(
+            FlowLayoutPanel topBar,
+            FlowLayoutPanel profileBar,
+            FlowLayoutPanel toolActions,
+            FlowLayoutPanel commitActions,
+            Form? sizingOwner)
+        {
+            int gridMinWidth = _grid.Columns
+                .Cast<DataGridViewColumn>()
+                .Sum(c => c.MinimumWidth) +
+                SystemInformation.VerticalScrollBarWidth +
+                16;
+
+            int monitorAreaWidth = gridMinWidth + _details.MinimumSize.Width + 44;
+            int topBarWidth = topBar.Padding.Horizontal + PreferredControlsWidth(topBar.Controls) + 24;
+            int profileBarWidth = profileBar.Padding.Horizontal + PreferredControlsWidth(profileBar.Controls) + 24;
+            int bottomWidth =
+                PreferredControlsWidth(toolActions.Controls) +
+                PreferredControlsWidth(commitActions.Controls) +
+                72;
+
+            int desiredClientWidth = Math.Max(
+                1120,
+                Math.Max(monitorAreaWidth, Math.Max(topBarWidth, Math.Max(profileBarWidth, bottomWidth))));
+
+            int visibleRows = Math.Min(Math.Max(_rows.Count, 5), 9);
+            int desiredGridHeight = _grid.ColumnHeadersHeight + (visibleRows * _grid.RowTemplate.Height) + 76;
+            int desiredClientHeight = Math.Max(
+                640,
+                topBar.Height + profileBar.Height + 54 + desiredGridHeight + 32);
+
+            var screen = sizingOwner != null && !sizingOwner.IsDisposed
+                ? Screen.FromControl(sizingOwner)
+                : Screen.FromPoint(Cursor.Position);
+            var workingArea = screen.WorkingArea;
+            int maxClientWidth = Math.Max(640, workingArea.Width - 80);
+            int maxClientHeight = Math.Max(480, workingArea.Height - 80);
+
+            var desiredClientSize = new Size(
+                Math.Min(desiredClientWidth, maxClientWidth),
+                Math.Min(desiredClientHeight, maxClientHeight));
+
+            var minimumClientSize = new Size(
+                Math.Min(920, maxClientWidth),
+                Math.Min(560, maxClientHeight));
+
+            MinimumSize = SizeFromClientSize(minimumClientSize);
+            ClientSize = desiredClientSize;
+        }
+
+        private void KeepSingleCheckedRow(
+            int selectedRowIndex,
+            Func<AliasViewRow, bool> isChecked,
+            Action<AliasViewRow, bool> setChecked)
+        {
+            if (!isChecked(_rows[selectedRowIndex]))
+                return;
+
+            for (int i = 0; i < _rows.Count; i++)
+            {
+                if (i != selectedRowIndex && isChecked(_rows[i]))
+                    setChecked(_rows[i], false);
+            }
+
+            _grid.Invalidate();
+        }
+
+        private static int PreferredControlsWidth(Control.ControlCollection controls)
+        {
+            int width = 0;
+            foreach (Control control in controls)
+            {
+                var preferred = control.GetPreferredSize(Size.Empty);
+                width += Math.Max(control.Width, preferred.Width) + control.Margin.Horizontal;
+            }
+
+            return width;
         }
 
         private void RemoveSelectedRows()
@@ -511,6 +614,7 @@ namespace WorkMonitorSwitcher
             _details.Text =
                 $"Alias: {row.Alias}{Environment.NewLine}" +
                 $"Preferred primary: {(row.IsPreferredPrimary ? "Yes" : "No")}{Environment.NewLine}" +
+                $"Fallback primary: {(row.IsFallbackPrimary ? "Yes" : "No")}{Environment.NewLine}" +
                 $"{Environment.NewLine}" +
                 $"Stable key:{Environment.NewLine}{row.StableKeyFull}{Environment.NewLine}" +
                 $"{Environment.NewLine}" +
