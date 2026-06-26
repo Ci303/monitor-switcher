@@ -13,6 +13,7 @@ using WorkMonitorSwitcher.Model;
 using WorkMonitorSwitcher.Services;
 using WorkMonitorSwitcher.UI;
 using System.Threading.Tasks;
+using static WorkMonitorSwitcher.Services.MonitorTargetResolver;
 
 
 namespace WorkMonitorSwitcher
@@ -36,6 +37,7 @@ namespace WorkMonitorSwitcher
         private readonly DiagnosticsLog _log;
         private readonly DetectionService _detectSvc;
         private readonly LayoutService _layoutSvc;
+        private readonly DisplayTopologyService _topologySvc;
 
         // In-memory state
         private UiSettings _uiSettings;
@@ -43,6 +45,7 @@ namespace WorkMonitorSwitcher
         private readonly Dictionary<string, MonitorControls> _controlsByKey = new(StringComparer.OrdinalIgnoreCase);
         private readonly List<Control> _dynamicControls = new();
         private List<DetectedMonitor> _detected = new();
+        private string _lastDetectionLogSignature = string.Empty;
 
         // Debounced refresh on display changes
         private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 800 };
@@ -94,6 +97,13 @@ namespace WorkMonitorSwitcher
             public string StdErr { get; init; } = string.Empty;
         }
 
+        private sealed class PrimaryDisableAttempt
+        {
+            public bool Attempted { get; init; }
+            public bool Success { get; init; }
+            public string ErrorMessage { get; init; } = string.Empty;
+        }
+
         public Form1()
         {
             // Reduce flicker
@@ -125,6 +135,7 @@ namespace WorkMonitorSwitcher
             _log = new DiagnosticsLog(_appDataDir);
             _detectSvc = new DetectionService(_toolPath);
             _layoutSvc = new LayoutService(_toolPath);
+            _topologySvc = new DisplayTopologyService();
 
             _uiSettings = _uiStore.LoadOrDefault();
             var startupEnabled = StartupManager.IsEnabled();
@@ -512,21 +523,23 @@ namespace WorkMonitorSwitcher
                 Close();
             });
 
+            Icon trayIcon;
+            try
+            {
+                trayIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+            }
+            catch
+            {
+                trayIcon = SystemIcons.Application;
+            }
+
             _trayIcon = new NotifyIcon
             {
                 Text = "Monitor Switcher",
                 ContextMenuStrip = _trayMenu,
+                Icon = trayIcon,
                 Visible = true
             };
-
-            try
-            {
-                _trayIcon.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-            }
-            catch
-            {
-                _trayIcon.Icon = SystemIcons.Application;
-            }
 
             _trayIcon.DoubleClick += (_, __) => RestoreFromTray();
         }
@@ -726,11 +739,51 @@ namespace WorkMonitorSwitcher
             }
 
             await Task.Delay(800);
+            await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
             RefreshMonitorsAndUi();
 
             if (showMessage)
                 ThemedMessageBox.Info(this, $"Layout profile '{profile}' restored.", "Restore Layout", _uiSettings.DarkMode);
         }
+
+        private async Task<DisplayTopologyResult> ApplySavedLayoutTopologyWithRetryAsync(string profile, string path)
+        {
+            DisplayTopologyResult? result = null;
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                result = _topologySvc.ApplyLayoutPositionsFromConfig(path);
+                if (result.Success)
+                    break;
+
+                await Task.Delay(500);
+            }
+
+            result ??= new DisplayTopologyResult
+            {
+                Success = false,
+                Message = "Saved layout topology was not attempted."
+            };
+
+            LogTopologyResult($"CCD layout restore for profile '{profile}'", result);
+            if (result.Success)
+                await Task.Delay(400);
+
+            return result;
+        }
+
+        private void LogTopologyResult(string action, DisplayTopologyResult result)
+        {
+            _log.Write(
+                $"{action}: success={result.Success}, validate={FormatCode(result.ValidateCode)}, " +
+                $"apply={FormatCode(result.ApplyCode)}, message='{result.Message}'.");
+
+            foreach (var detail in result.Details)
+                _log.Write($"{action}: {detail}");
+        }
+
+        private static string FormatCode(int? code)
+            => code.HasValue ? code.Value.ToString() : "n/a";
 
         // ---------- Theme / caption ----------
 
@@ -962,7 +1015,9 @@ namespace WorkMonitorSwitcher
 
             // Attempt to re-bind aliases if stable keys changed (e.g., port swaps)
             ReconcileAliasesForDetected();
+            SuppressShadowedDeviceFallbackDetections();
             ReconcilePositionalAliases();
+            LogDetectionSnapshotIfChanged();
 
             // First-run seeding if exactly three monitors and no aliases
             if (_aliasMap.Count == 0 && _detected.Count == 3)
@@ -981,9 +1036,10 @@ namespace WorkMonitorSwitcher
                     info = new MonitorInfo();
                     _aliasMap[m.StableKey] = info;
                 }
-                if (!string.IsNullOrWhiteSpace(m.DeviceName))
+                if (m.IsPresent && m.IsActive && !string.IsNullOrWhiteSpace(m.DeviceName))
                     info.LastDeviceName = m.DeviceName;
-                info.LastKnownX = m.PositionX;
+                if (m.IsPresent && m.IsActive)
+                    info.LastKnownX = m.PositionX;
                 if (!string.IsNullOrWhiteSpace(m.MonitorKey))
                     info.LastRegistryKey = m.MonitorKey;
                 if (!string.IsNullOrWhiteSpace(m.SerialNumber))
@@ -993,11 +1049,12 @@ namespace WorkMonitorSwitcher
                 if (!string.IsNullOrWhiteSpace(m.MonitorId))
                     info.LastMonitorId = m.MonitorId;
 
-                // NEW: remember useful command targets (device + friendly name)
-                EnsureKnownTargets(m.StableKey, m.DeviceName, m.Name);
+                if (m.IsPresent && m.IsActive)
+                    MonitorTargetResolver.EnsureKnownTargets(_aliasMap, m.StableKey, m.DeviceName, m.Name);
             }
 
             RemoveShadowedDeviceAliases();
+            MonitorTargetResolver.PruneKnownTargets(_aliasMap, _detected);
             _aliasStore.Save(_aliasMap);
 
             var toShow = BuildPresentationList();
@@ -1123,61 +1180,7 @@ namespace WorkMonitorSwitcher
         }
 
         private List<DetectedMonitor> BuildPresentationList()
-        {
-            var presentByKey = _detected.ToDictionary(d => d.StableKey, StringComparer.OrdinalIgnoreCase);
-            var allKeys = new HashSet<string>(presentByKey.Keys, StringComparer.OrdinalIgnoreCase);
-            foreach (var key in _aliasMap.Keys) allKeys.Add(key);
-
-            var list = new List<DetectedMonitor>();
-            foreach (var key in allKeys)
-            {
-                if (presentByKey.TryGetValue(key, out var d))
-                {
-                    d.IsPresent = true;
-                    list.Add(d);
-                }
-                else
-                {
-                    var info = _aliasMap.TryGetValue(key, out var mi) ? mi : new MonitorInfo();
-                    list.Add(new DetectedMonitor
-                    {
-                        StableKey = key,
-                        Name = GetAliasFor(key),
-                        DeviceName = info.LastDeviceName ?? string.Empty,
-                        MonitorKey = info.LastRegistryKey ?? string.Empty,
-                        MonitorId = string.Empty,
-                        InstanceId = string.Empty,
-                        SerialNumber = string.Empty,
-                        IsActive = false,
-                        IsPresent = false,
-                        PositionX = info.LastKnownX ?? 0
-                    });
-                }
-            }
-
-            return list
-                .OrderBy(m => GetPreferredOrder(m.StableKey))
-                .ThenBy(m => AliasHintRank(GetAliasFor(m.StableKey)))
-                .ThenBy(m => m.PositionX)
-                .ThenBy(m => GetAliasFor(m.StableKey), StringComparer.OrdinalIgnoreCase)
-                .ToList();
-        }
-
-        private int GetPreferredOrder(string stableKey)
-        {
-            if (_aliasMap.TryGetValue(stableKey, out var info) && info.PreferredOrder.HasValue)
-                return info.PreferredOrder.Value;
-            return int.MaxValue - 100000;
-        }
-
-        private static int AliasHintRank(string alias)
-        {
-            if (alias.Contains("Left", StringComparison.OrdinalIgnoreCase)) return 0;
-            if (alias.Contains("Middle", StringComparison.OrdinalIgnoreCase)) return 1;
-            if (alias.Contains("Centre", StringComparison.OrdinalIgnoreCase)) return 1;
-            if (alias.Contains("Right", StringComparison.OrdinalIgnoreCase)) return 2;
-            return 50;
-        }
+            => MonitorPresentationBuilder.Build(_detected, _aliasMap);
 
         private void AddMonitorControls(DetectedMonitor monitor, string friendlyName, int positionY)
         {
@@ -1320,7 +1323,7 @@ namespace WorkMonitorSwitcher
                     return;
             }
 
-            var target = ResolveDisableTargetArg(stableKey);
+            var target = MonitorTargetResolver.ResolveDisableTargetArg(stableKey, _detected, _aliasMap);
             if (string.IsNullOrWhiteSpace(target))
             {
                 LogMonitorAction($"DISABLE {stableKey}: no target resolved.");
@@ -1332,44 +1335,105 @@ namespace WorkMonitorSwitcher
             LogMonitorAction($"DISABLE {stableKey}: selected target '{target}'.");
             _log.Write($"Disable requested for '{GetAliasFor(stableKey)}' using target '{target}'.");
 
-            // --- NEW: if this window is currently on the display we're about to disable,
-            // move it to a safe, still-active screen first.
-            // We try to get the live \\.\DISPLAYn for this stableKey.
             var disablingDevice = TryGetDeviceNameForStableKey(stableKey);
-            if (!string.IsNullOrWhiteSpace(disablingDevice))
-            {
-                MoveWindowIfHostedOn(disablingDevice);
-                // tiny settle helps avoid a visible jump if the desktop is busy
-                await Task.Delay(100);
-            }
-
-            // Capture baseline layout if everything is currently active
-            bool allActiveNow = _detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive);
-            if (allActiveNow) _layoutSvc.SaveLayout(SelectedLayoutPath());
 
             // Show WORKING… and lock the row
             SetRowBusy(stableKey, true);
             UpdateButtonStatus();
 
-            var res = await ExecToolAsync("/disable", target);
-            LogMonitorAction($"DISABLE {stableKey}: exit={res.ExitCode}, stderr='{res.StdErr}'.");
-            _log.Write($"Disable result for '{GetAliasFor(stableKey)}': exit={res.ExitCode}, stderr='{res.StdErr}'.");
+            bool disabledByTopology = false;
+            bool failedBeforeDisable = false;
 
-            // Give the desktop a brief moment to settle
-            await Task.Delay(400);
-
-            // Clear busy and reflect result
-            SetRowBusy(stableKey, false);
-
-            if (res.ExitCode != 0)
+            try
             {
-                ThemedMessageBox.Error(this,
-                    $"Disable failed (exit {res.ExitCode})." +
-                    (string.IsNullOrWhiteSpace(res.StdErr) ? string.Empty : $"\n{res.StdErr}"),
-                    "Monitor Switcher", _uiSettings.DarkMode);
+                // Capture baseline layout before any primary-monitor topology change.
+                bool allActiveNow = _detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive);
+                if (allActiveNow) _layoutSvc.SaveLayout(SelectedLayoutPath());
+
+                if (!string.IsNullOrWhiteSpace(disablingDevice))
+                {
+                    MoveWindowIfHostedOn(disablingDevice);
+                    await Task.Delay(100);
+
+                    var primaryDisable = await DisablePrimaryUsingTopologyIfNeededAsync(disablingDevice);
+                    if (primaryDisable.Attempted)
+                    {
+                        if (!primaryDisable.Success)
+                        {
+                            failedBeforeDisable = true;
+                            ThemedMessageBox.Error(this,
+                                primaryDisable.ErrorMessage,
+                                "Monitor Switcher", _uiSettings.DarkMode);
+                        }
+                        else
+                        {
+                            disabledByTopology = true;
+                        }
+                    }
+                }
+
+                if (!failedBeforeDisable && !disabledByTopology)
+                {
+                    var res = await ExecToolAsync("/disable", target);
+                    LogMonitorAction($"DISABLE {stableKey}: exit={res.ExitCode}, stderr='{res.StdErr}'.");
+                    _log.Write($"Disable result for '{GetAliasFor(stableKey)}': exit={res.ExitCode}, stderr='{res.StdErr}'.");
+
+                    if (res.ExitCode != 0)
+                    {
+                        ThemedMessageBox.Error(this,
+                            $"Disable failed (exit {res.ExitCode})." +
+                            (string.IsNullOrWhiteSpace(res.StdErr) ? string.Empty : $"\n{res.StdErr}"),
+                            "Monitor Switcher", _uiSettings.DarkMode);
+                    }
+                }
+                else if (disabledByTopology)
+                {
+                    LogMonitorAction($"DISABLE {stableKey}: completed by CCD topology update.");
+                    _log.Write($"Disable result for '{GetAliasFor(stableKey)}': completed by CCD topology update.");
+                }
+
+                // Give the desktop a brief moment to settle.
+                await Task.Delay(400);
+            }
+            finally
+            {
+                SetRowBusy(stableKey, false);
             }
 
             RefreshMonitorsAndUi();
+        }
+
+        private async Task<PrimaryDisableAttempt> DisablePrimaryUsingTopologyIfNeededAsync(string disablingDevice)
+        {
+            var primary = Screen.PrimaryScreen;
+            if (primary == null ||
+                !primary.DeviceName.Equals(disablingDevice, StringComparison.OrdinalIgnoreCase))
+                return new PrimaryDisableAttempt { Attempted = false, Success = true };
+
+            var fallback = GetFallbackActiveScreen(disablingDevice);
+            if (fallback.DeviceName.Equals(disablingDevice, StringComparison.OrdinalIgnoreCase))
+            {
+                return new PrimaryDisableAttempt
+                {
+                    Attempted = true,
+                    Success = false,
+                    ErrorMessage = "Cannot disable the primary monitor because no fallback monitor is available."
+                };
+            }
+
+            _log.Write($"Disabling primary monitor {disablingDevice} with fallback primary {fallback.DeviceName}.");
+            var result = _topologySvc.DisableDisplayUsingFallbackPrimary(disablingDevice, fallback.DeviceName);
+            LogTopologyResult($"CCD primary disable {disablingDevice}", result);
+            await Task.Delay(700);
+
+            return new PrimaryDisableAttempt
+            {
+                Attempted = true,
+                Success = result.Success,
+                ErrorMessage = result.Success
+                    ? string.Empty
+                    : $"Disable failed before the monitor could be deactivated. {result.Message}"
+            };
         }
 
 
@@ -1377,7 +1441,7 @@ namespace WorkMonitorSwitcher
         {
             if (sender is not Button btn || btn.Tag is not string stableKey) return;
 
-            var enableTargets = ResolveEnableTargetArgs(stableKey).ToList();
+            var enableTargets = MonitorTargetResolver.ResolveEnableTargetArgs(stableKey, _detected, _aliasMap).ToList();
             if (enableTargets.Count == 0)
             {
                 LogMonitorAction($"ENABLE {stableKey}: no targets resolved.");
@@ -1395,20 +1459,29 @@ namespace WorkMonitorSwitcher
 
             ToolResult? last = null;
             bool enabledTarget = false;
-            foreach (var target in enableTargets)
+            for (int i = 0; i < enableTargets.Count; i++)
             {
+                var target = enableTargets[i];
                 LogMonitorAction($"ENABLE {stableKey}: trying target '{target}'.");
                 last = await ExecToolAsync("/enable", target);
                 LogMonitorAction($"ENABLE {stableKey}: target '{target}' exit={last.ExitCode}, stderr='{last.StdErr}'.");
                 _log.Write($"Enable attempt for '{GetAliasFor(stableKey)}' target '{target}': exit={last.ExitCode}, stderr='{last.StdErr}'.");
-                await Task.Delay(500);
 
-                var detectedNow = _detectSvc.Detect();
-                if (IsStableKeyActive(detectedNow, stableKey))
+                var detectedNow = await WaitForEnableDetectionAsync(stableKey);
+                if (MonitorTargetResolver.IsStableKeyActive(detectedNow, stableKey))
                 {
                     LogMonitorAction($"ENABLE {stableKey}: activation confirmed after target '{target}'.");
                     enabledTarget = true;
                     break;
+                }
+
+                foreach (var nextTarget in MonitorTargetResolver.ResolveEnableTargetArgs(stableKey, detectedNow, _aliasMap))
+                {
+                    if (enableTargets.Any(existing => MonitorTargetResolver.TargetsEquivalent(existing, nextTarget)))
+                        continue;
+
+                    enableTargets.Add(nextTarget);
+                    _log.Write($"Enable candidate added for '{GetAliasFor(stableKey)}' after re-detect: '{nextTarget}'.");
                 }
 
                 LogMonitorAction($"ENABLE {stableKey}: target '{target}' did not activate requested stable key.");
@@ -1437,19 +1510,47 @@ namespace WorkMonitorSwitcher
             // If all are now active, restore saved layout
             if (_detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive))
             {
-                if (!_layoutSvc.LoadLayout(SelectedLayoutPath()))
+                var profile = SelectedLayoutProfileName();
+                var path = SelectedLayoutPath();
+                if (!_layoutSvc.LoadLayout(path))
                 {
                     // Optional: notify if missing
                     // ThemedMessageBox.Warn(this, "Saved monitor layout file not found.", "Monitor Switcher", _uiSettings.DarkMode);
                 }
                 else
                 {
-                    _log.Write($"Auto-restored layout profile '{SelectedLayoutProfileName()}' after all monitors became active.");
+                    _log.Write($"Auto-restored layout profile '{profile}' after all monitors became active.");
+                    await Task.Delay(800);
+                    await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
                 }
 
-                await Task.Delay(800);
                 RefreshMonitorsAndUi();
             }
+        }
+
+        private async Task<List<DetectedMonitor>> WaitForEnableDetectionAsync(string stableKey)
+        {
+            var latest = new List<DetectedMonitor>();
+
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                await Task.Delay(500);
+                latest = _detectSvc.Detect();
+
+                if (MonitorTargetResolver.IsStableKeyActive(latest, stableKey))
+                    break;
+
+                if (latest.Any(d =>
+                        d.StableKey.Equals(stableKey, StringComparison.OrdinalIgnoreCase) &&
+                        d.IsPresent &&
+                        !d.IsActive &&
+                        !string.IsNullOrWhiteSpace(d.DeviceName)))
+                {
+                    break;
+                }
+            }
+
+            return latest;
         }
 
         private void UpdateButtonStatus()
@@ -1490,9 +1591,6 @@ namespace WorkMonitorSwitcher
 
                 bool isPresent = live != null;
                 bool isActive = live?.IsActive == true;
-                bool hasLast = !string.IsNullOrWhiteSpace(info?.LastDeviceName);
-                bool hasKnownTargets = info != null && info.KnownTargets.Any();
-
                 ctrls.StatusLabel.Text = isPresent ? (isActive ? "ONLINE" : "DISABLED") : "OFFLINE";
                 ctrls.StatusLabel.ForeColor = isPresent
                     ? (isActive ? palette.StatusOk : palette.StatusWarn)
@@ -1507,7 +1605,7 @@ namespace WorkMonitorSwitcher
                 }
 
                 bool canDisable = isPresent && isActive && activeCount > 1;
-                bool canEnable = !isActive && (hasLast || hasKnownTargets);
+                bool canEnable = !isActive && MonitorTargetResolver.ResolveEnableTargetArgs(key, _detected, _aliasMap).Any();
 
                 ctrls.DisableButton.Enabled = canDisable;
                 ctrls.DisableButton.ForeColor = canDisable ? ForeColor : palette.TextSubtle;
@@ -1528,10 +1626,10 @@ namespace WorkMonitorSwitcher
                                                       d.StableKey.Equals(primary.Key, StringComparison.OrdinalIgnoreCase));
                 if (m != null)
                 {
-                    var target = ResolveTargetArg(primary.Key);
+                    var target = MonitorTargetResolver.ResolveTargetArg(primary.Key, _detected, _aliasMap);
                     if (!string.IsNullOrWhiteSpace(target))
                     {
-                        _layoutSvc.SetPrimary(target);
+                        SetPrimaryWithTopologyFallback(target, "preferred primary");
                         return;
                     }
                 }
@@ -1542,10 +1640,18 @@ namespace WorkMonitorSwitcher
                                        .FirstOrDefault();
             if (firstActive != null)
             {
-                var target = ResolveTargetArg(firstActive.StableKey);
+                var target = MonitorTargetResolver.ResolveTargetArg(firstActive.StableKey, _detected, _aliasMap);
                 if (!string.IsNullOrWhiteSpace(target))
-                    _layoutSvc.SetPrimary(target);
+                    SetPrimaryWithTopologyFallback(target, "left-most active primary");
             }
+        }
+
+        private void SetPrimaryWithTopologyFallback(string target, string reason)
+        {
+            var result = _topologySvc.SetPrimaryDisplay(target);
+            LogTopologyResult($"CCD set primary ({reason})", result);
+            if (!result.Success)
+                _layoutSvc.SetPrimary(target);
         }
 
         // ---------- Helpers ----------
@@ -1689,8 +1795,91 @@ namespace WorkMonitorSwitcher
             }
         }
 
+        private void SuppressShadowedDeviceFallbackDetections()
+        {
+            if (_aliasMap.Count == 0 || _detected.Count == 0) return;
+
+            var detectedKeys = new HashSet<string>(_detected.Select(d => d.StableKey), StringComparer.OrdinalIgnoreCase);
+            var missingSavedHardwareAliases = _aliasMap
+                .Where(kv =>
+                    !IsDeviceFallbackStableKey(kv.Key) &&
+                    !detectedKeys.Contains(kv.Key) &&
+                    HasRestoreTarget(kv.Value))
+                .Select(kv => kv.Value)
+                .ToList();
+
+            if (missingSavedHardwareAliases.Count == 0)
+                return;
+
+            var suppressed = _detected
+                .Where(d =>
+                    IsDeviceFallbackStableKey(d.StableKey) &&
+                    !d.IsActive &&
+                    IsGeneratedDeviceFallbackAlias(d.StableKey) &&
+                    MatchesMissingSavedHardwareAliasTarget(d, missingSavedHardwareAliases))
+                .ToList();
+
+            if (suppressed.Count == 0)
+                return;
+
+            var suppressedKeys = new HashSet<string>(
+                suppressed.Select(d => d.StableKey),
+                StringComparer.OrdinalIgnoreCase);
+
+            _detected = _detected
+                .Where(d => !suppressedKeys.Contains(d.StableKey))
+                .ToList();
+
+            foreach (var key in suppressedKeys)
+            {
+                if (_aliasMap.TryGetValue(key, out var info) && IsGeneratedDeviceFallbackAlias(key, info))
+                    _aliasMap.Remove(key);
+            }
+
+            foreach (var monitor in suppressed)
+            {
+                _log.Write(
+                    $"Suppressed anonymous display fallback '{monitor.StableKey}' on {monitor.DeviceName} because a saved hardware monitor is currently missing.");
+            }
+        }
+
         private static bool IsDeviceFallbackStableKey(string stableKey)
             => stableKey.Trim().StartsWith("DEV:", StringComparison.OrdinalIgnoreCase);
+
+        private static bool HasRestoreTarget(MonitorInfo info)
+            => !string.IsNullOrWhiteSpace(info.LastDeviceName) ||
+               info.KnownTargets.Any(t => !string.IsNullOrWhiteSpace(t));
+
+        private static bool MatchesMissingSavedHardwareAliasTarget(DetectedMonitor monitor, IReadOnlyCollection<MonitorInfo> missingAliases)
+        {
+            var device = NormalizeDeviceNameForComparison(monitor.DeviceName);
+            if (string.IsNullOrWhiteSpace(device))
+                device = NormalizeDeviceNameForComparison(monitor.StableKey);
+            if (string.IsNullOrWhiteSpace(device))
+                return false;
+
+            return missingAliases.Any(info =>
+                DeviceTargetEquals(info.LastDeviceName, device) ||
+                info.KnownTargets.Any(t => IsLikelyDeviceName(t) && DeviceTargetEquals(t, device)));
+        }
+
+        private static bool DeviceTargetEquals(string? target, string device)
+            => string.Equals(NormalizeDeviceNameForComparison(target), device, StringComparison.OrdinalIgnoreCase);
+
+        private bool IsGeneratedDeviceFallbackAlias(string stableKey)
+        {
+            return !_aliasMap.TryGetValue(stableKey, out var info) ||
+                   IsGeneratedDeviceFallbackAlias(stableKey, info);
+        }
+
+        private static bool IsGeneratedDeviceFallbackAlias(string stableKey, MonitorInfo info)
+        {
+            return IsPlaceholderAlias(info.Name, stableKey) &&
+                   string.IsNullOrWhiteSpace(info.LastSerialNumber) &&
+                   string.IsNullOrWhiteSpace(info.LastInstanceId) &&
+                   string.IsNullOrWhiteSpace(info.LastRegistryKey) &&
+                   string.IsNullOrWhiteSpace(info.LastMonitorId);
+        }
 
         private static string NormalizeDeviceNameForComparison(string? value)
         {
@@ -1842,173 +2031,40 @@ namespace WorkMonitorSwitcher
             _aliasMap[stableKey] = info;
         }
 
-        // New helpers for robust target resolution
-        private static string NormaliseTarget(string s)
+        private void LogDetectionSnapshotIfChanged()
         {
-            var t = (s ?? string.Empty).Trim();
-            if (t.Length >= 2 &&
-                t.StartsWith("\"", StringComparison.Ordinal) &&
-                t.EndsWith("\"", StringComparison.Ordinal))
-            {
-                t = t[1..^1];
-            }
-            return t;
+            var rows = _detected
+                .OrderBy(d => d.PositionX)
+                .ThenBy(d => d.DeviceName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(d => d.StableKey, StringComparer.OrdinalIgnoreCase)
+                .Select(d => string.Join(", ",
+                    $"key={LogValue(d.StableKey)}",
+                    $"device={LogValue(d.DeviceName)}",
+                    $"active={d.IsActive}",
+                    $"present={d.IsPresent}",
+                    $"x={d.PositionX}",
+                    $"serial={LogValue(d.SerialNumber)}",
+                    $"monitorId={LogValue(d.MonitorId)}",
+                    $"instanceId={LogValue(d.InstanceId)}",
+                    $"monitorKey={LogValue(d.MonitorKey)}"))
+                .ToList();
+
+            var signature = string.Join("|", rows);
+            if (signature.Equals(_lastDetectionLogSignature, StringComparison.Ordinal))
+                return;
+
+            _lastDetectionLogSignature = signature;
+
+            int active = _detected.Count(d => d.IsPresent && d.IsActive);
+            int present = _detected.Count(d => d.IsPresent);
+            _log.Write($"Detected monitor state changed: active={active}, present={present}, rows={_detected.Count}.");
+
+            foreach (var row in rows)
+                _log.Write($"Detected monitor: {row}.");
         }
 
-        private void EnsureKnownTargets(string stableKey, params string?[] candidates)
-        {
-            if (!_aliasMap.TryGetValue(stableKey, out var info))
-            {
-                info = new MonitorInfo();
-                _aliasMap[stableKey] = info;
-            }
-
-            for (int i = candidates.Length - 1; i >= 0; i--)
-            {
-                var c = candidates[i];
-                var t = (c ?? string.Empty).Trim();
-                if (string.IsNullOrEmpty(t)) continue;
-
-                t = NormaliseTarget(t);
-
-                int existingIndex = info.KnownTargets.FindIndex(x => string.Equals(x, t, StringComparison.OrdinalIgnoreCase));
-                if (existingIndex >= 0)
-                    info.KnownTargets.RemoveAt(existingIndex);
-
-                // Most-recent targets go first to avoid stale DISPLAYn mappings.
-                info.KnownTargets.Insert(0, t);
-            }
-
-            const int MaxKnownTargets = 8;
-            if (info.KnownTargets.Count > MaxKnownTargets)
-                info.KnownTargets.RemoveRange(MaxKnownTargets, info.KnownTargets.Count - MaxKnownTargets);
-        }
-
-        private string? ResolveTargetArg(string stableKey)
-        {
-            // Fall back to live detection
-            var live = _detected.FirstOrDefault(d => d.StableKey.Equals(stableKey, StringComparison.OrdinalIgnoreCase));
-            if (live != null)
-            {
-                var liveDevice = NormaliseTarget(live.DeviceName);
-                if (!string.IsNullOrWhiteSpace(liveDevice)) return liveDevice;
-
-                var liveName = NormaliseTarget(live.Name);
-                if (!string.IsNullOrWhiteSpace(liveName) && IsUniqueMonitorName(liveName))
-                    return liveName;
-            }
-
-            // Prefer last-known device name before older, potentially stale targets
-            if (_aliasMap.TryGetValue(stableKey, out var info))
-            {
-                if (!string.IsNullOrWhiteSpace(info.LastDeviceName) &&
-                    !IsDeviceNameInUseByOther(stableKey, info.LastDeviceName))
-                    return NormaliseTarget(info.LastDeviceName);
-
-                var knownDevice = info.KnownTargets
-                    .FirstOrDefault(t => IsLikelyDeviceName(t) && !IsDeviceNameInUseByOther(stableKey, t));
-                if (!string.IsNullOrWhiteSpace(knownDevice))
-                    return knownDevice;
-
-                var anyKnown = info.KnownTargets.FirstOrDefault(t => !string.IsNullOrWhiteSpace(t));
-                if (!string.IsNullOrWhiteSpace(anyKnown))
-                    return anyKnown;
-            }
-
-            return null;
-        }
-
-        private string? ResolveDisableTargetArg(string stableKey)
-        {
-            var live = _detected.FirstOrDefault(d =>
-                d.StableKey.Equals(stableKey, StringComparison.OrdinalIgnoreCase) &&
-                d.IsPresent &&
-                d.IsActive);
-            if (live != null)
-            {
-                var liveDevice = NormaliseTarget(live.DeviceName);
-                if (!string.IsNullOrWhiteSpace(liveDevice))
-                    return liveDevice;
-            }
-
-            return ResolveTargetArg(stableKey);
-        }
-
-        private IEnumerable<string> ResolveEnableTargetArgs(string stableKey)
-        {
-            var candidates = new List<string>();
-            void Add(string? raw)
-            {
-                var t = NormaliseTarget(raw ?? string.Empty);
-                if (string.IsNullOrWhiteSpace(t)) return;
-                if (candidates.Any(x => x.Equals(t, StringComparison.OrdinalIgnoreCase))) return;
-                candidates.Add(t);
-            }
-
-            var live = _detected.FirstOrDefault(d => d.StableKey.Equals(stableKey, StringComparison.OrdinalIgnoreCase));
-            if (live != null)
-            {
-                var liveName = NormaliseTarget(live.Name);
-                if (!string.IsNullOrWhiteSpace(liveName) && !IsLikelyDeviceName(liveName) && IsUniqueMonitorName(liveName))
-                    Add(liveName);
-            }
-
-            if (_aliasMap.TryGetValue(stableKey, out var info))
-            {
-                foreach (var knownName in info.KnownTargets.Where(t => !IsLikelyDeviceName(t)))
-                {
-                    if (IsUniqueMonitorName(knownName))
-                        Add(knownName);
-                }
-
-                if (!string.IsNullOrWhiteSpace(info.LastDeviceName) &&
-                    !IsDeviceNameInUseByOther(stableKey, info.LastDeviceName))
-                {
-                    Add(info.LastDeviceName);
-                }
-
-                foreach (var knownDevice in info.KnownTargets.Where(t =>
-                             IsLikelyDeviceName(t) && !IsDeviceNameInUseByOther(stableKey, t)))
-                {
-                    Add(knownDevice);
-                }
-
-                foreach (var knownAny in info.KnownTargets)
-                    Add(knownAny);
-            }
-
-            Add(ResolveTargetArg(stableKey));
-            return candidates;
-        }
-
-        private static bool IsStableKeyActive(IEnumerable<DetectedMonitor> detected, string stableKey)
-        {
-            return detected.Any(d =>
-                d.StableKey.Equals(stableKey, StringComparison.OrdinalIgnoreCase) &&
-                d.IsPresent &&
-                d.IsActive);
-        }
-
-        private static bool IsLikelyDeviceName(string? t)
-        {
-            if (string.IsNullOrWhiteSpace(t)) return false;
-            var v = t.Trim();
-            return v.StartsWith(@"\\.\DISPLAY", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private bool IsDeviceNameInUseByOther(string stableKey, string? deviceName)
-        {
-            if (string.IsNullOrWhiteSpace(deviceName)) return false;
-            var live = _detected.FirstOrDefault(d =>
-                d.DeviceName.Equals(deviceName, StringComparison.OrdinalIgnoreCase));
-            return live != null && !live.StableKey.Equals(stableKey, StringComparison.OrdinalIgnoreCase);
-        }
-
-        private bool IsUniqueMonitorName(string name)
-        {
-            int count = _detected.Count(d => d.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-            return count == 1;
-        }
+        private static string LogValue(string? value)
+            => string.IsNullOrWhiteSpace(value) ? "<blank>" : value.Trim();
 
         private static void LogMonitorAction(string message)
         {

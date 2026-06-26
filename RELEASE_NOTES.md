@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v0.3.3 - 2026-06-26
+
+### Fixed
+
+- Fixed duplicate phantom `DEV:` monitor rows appearing after disabling displays.
+- Fixed inactive monitor enable targeting so the app prefers the current live inactive display identity before stale saved display aliases.
+- Fixed disabling the current primary monitor by applying the display topology directly when MultiMonitorTool reports success but leaves the primary display unchanged.
+- Fixed saved-layout restore after re-enabling monitors so primary display and positions are reapplied from the saved layout.
+- Fixed notification-area icon initialisation so the tray icon is assigned before it is shown.
+
+### Improved
+
+- Added focused regression coverage for monitor target resolution, duplicate detected rows, disconnected-state presentation, and primary-disable topology positioning.
+
 ## v0.3.2 - 2026-05-26
 
 ### Fixed

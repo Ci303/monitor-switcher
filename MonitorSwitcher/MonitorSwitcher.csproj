@@ -35,6 +35,10 @@
 	</ItemGroup>
 
 	<ItemGroup>
+	  <InternalsVisibleTo Include="MonitorSwitcher.Tests" />
+	</ItemGroup>
+
+	<ItemGroup>
 	  <Content Include="MonitorSwitcher_transparent.ico">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 	    <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>

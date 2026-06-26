@@ -125,18 +125,30 @@ namespace WorkMonitorSwitcher.Services
 
                 var lines = ReadAllLinesBestEffort(tmp);
                 DetectedMonitor? cur = null;
+                bool currentPresenceKnown = false;
+
+                void AddCurrent()
+                {
+                    if (cur == null) return;
+                    if (string.IsNullOrWhiteSpace(cur.DeviceName)) return;
+
+                    if (string.IsNullOrWhiteSpace(cur.Name))
+                        cur.Name = cur.DeviceName;
+
+                    cur.StableKey = BuildStableKey(cur.SerialNumber, cur.MonitorId, cur.InstanceId, cur.MonitorKey, cur.DeviceName);
+                    if (!currentPresenceKnown)
+                        cur.IsPresent = true;
+
+                    result.Add(cur);
+                }
 
                 foreach (var line in lines)
                 {
                     if (line.StartsWith("==========================================="))
                     {
-                        if (cur != null)
-                        {
-                            cur.StableKey = BuildStableKey(cur.SerialNumber, cur.MonitorId, cur.InstanceId, cur.MonitorKey, cur.DeviceName);
-                            cur.IsPresent = true;
-                            result.Add(cur);
-                        }
+                        AddCurrent();
                         cur = new DetectedMonitor();
+                        currentPresenceKnown = false;
                         continue;
                     }
                     if (cur == null) continue;
@@ -157,23 +169,19 @@ namespace WorkMonitorSwitcher.Services
                     AssignFromText(line, "Serial Number", v => cur.SerialNumber = v);
                     AssignFromText(line, "Monitor Serial Number", v => cur.SerialNumber = v);
                     AssignFromText(line, "Active", v => cur.IsActive = v.Equals("Yes", StringComparison.OrdinalIgnoreCase));
-                    AssignFromText(line, "Disconnected", v => cur.IsPresent = !v.Equals("Yes", StringComparison.OrdinalIgnoreCase));
+                    AssignFromText(line, "Disconnected", v =>
+                    {
+                        cur.IsPresent = !v.Equals("Yes", StringComparison.OrdinalIgnoreCase);
+                        currentPresenceKnown = true;
+                    });
                     AssignFromText(line, "Position X", v => cur.PositionX = ParsePositionX(v));
                     AssignFromText(line, "Left-Top", v => cur.PositionX = ParsePositionX(v));
                 }
-                if (cur != null)
-                {
-                    if (string.IsNullOrWhiteSpace(cur.Name))
-                        cur.Name = cur.DeviceName;
-                    cur.StableKey = BuildStableKey(cur.SerialNumber, cur.MonitorId, cur.InstanceId, cur.MonitorKey, cur.DeviceName);
-                    if (!cur.IsPresent)
-                        cur.IsPresent = true;
-                    result.Add(cur);
-                }
+                AddCurrent();
 
                 ReconcileWithScreenApi(result);
 
-                return result.Where(r => !string.IsNullOrWhiteSpace(r.DeviceName)).ToList();
+                return result;
             }
             catch
             {
@@ -327,17 +335,97 @@ namespace WorkMonitorSwitcher.Services
             try
             {
                 var bytes = File.ReadAllBytes(path);
-                var textDefault = Encoding.Default.GetString(bytes);
-                if (textDefault.Contains(",") || textDefault.Contains("===="))
-                    return SplitLines(textDefault);
 
-                var textUtf8 = Encoding.UTF8.GetString(bytes);
-                return SplitLines(textUtf8);
+                foreach (var encoding in CandidateEncodings(bytes))
+                {
+                    var text = encoding.GetString(bytes).TrimStart('\uFEFF');
+                    if (LooksLikeMonitorToolExport(text))
+                        return SplitLines(text);
+                }
+
+                return SplitLines(Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF'));
             }
             catch
             {
                 return Array.Empty<string>();
             }
+        }
+
+        private static IEnumerable<Encoding> CandidateEncodings(byte[] bytes)
+        {
+            var encodings = new List<Encoding>();
+
+            void Add(Encoding encoding)
+            {
+                if (encodings.Any(e => e.CodePage == encoding.CodePage)) return;
+                encodings.Add(encoding);
+            }
+
+            if (bytes.Length >= 3 &&
+                bytes[0] == 0xEF &&
+                bytes[1] == 0xBB &&
+                bytes[2] == 0xBF)
+            {
+                Add(Encoding.UTF8);
+            }
+            else if (bytes.Length >= 2 &&
+                     bytes[0] == 0xFF &&
+                     bytes[1] == 0xFE)
+            {
+                Add(Encoding.Unicode);
+            }
+            else if (bytes.Length >= 2 &&
+                     bytes[0] == 0xFE &&
+                     bytes[1] == 0xFF)
+            {
+                Add(Encoding.BigEndianUnicode);
+            }
+            else if (LooksLikeUtf16LittleEndian(bytes))
+            {
+                Add(Encoding.Unicode);
+            }
+            else if (LooksLikeUtf16BigEndian(bytes))
+            {
+                Add(Encoding.BigEndianUnicode);
+            }
+
+            Add(Encoding.UTF8);
+            Add(Encoding.Default);
+            Add(Encoding.Unicode);
+            Add(Encoding.BigEndianUnicode);
+
+            return encodings;
+        }
+
+        private static bool LooksLikeUtf16LittleEndian(byte[] bytes)
+            => HasNullBytePattern(bytes, expectedNullByteOffset: 1);
+
+        private static bool LooksLikeUtf16BigEndian(byte[] bytes)
+            => HasNullBytePattern(bytes, expectedNullByteOffset: 0);
+
+        private static bool HasNullBytePattern(byte[] bytes, int expectedNullByteOffset)
+        {
+            int pairsToInspect = Math.Min(bytes.Length / 2, 128);
+            if (pairsToInspect < 8) return false;
+
+            int nulls = 0;
+            for (int i = 0; i < pairsToInspect; i++)
+            {
+                if (bytes[(i * 2) + expectedNullByteOffset] == 0)
+                    nulls++;
+            }
+
+            return nulls >= pairsToInspect * 3 / 4;
+        }
+
+        private static bool LooksLikeMonitorToolExport(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            return text.Contains("Resolution", StringComparison.OrdinalIgnoreCase) &&
+                   (text.Contains("Monitor ID", StringComparison.OrdinalIgnoreCase) ||
+                    text.Contains("Monitor Key", StringComparison.OrdinalIgnoreCase) ||
+                    text.Contains("Left-Top", StringComparison.OrdinalIgnoreCase));
         }
 
         private static string[] SplitLines(string s)
