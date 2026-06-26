@@ -128,7 +128,9 @@ namespace WorkMonitorSwitcher.Services
                 .ThenBy(n => n, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            File.WriteAllText(_indexPath, JsonSerializer.Serialize(names, new JsonSerializerOptions { WriteIndented = true }));
+            AtomicFileWriter.WriteAllText(
+                _indexPath,
+                JsonSerializer.Serialize(names, new JsonSerializerOptions { WriteIndented = true }));
         }
 
         private static string SanitizeFileName(string name)

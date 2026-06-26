@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.3.6 - 2026-06-26
+
+### Improved
+
+- Hardened settings and layout-profile persistence with atomic JSON writes and backup files.
+- Serialised monitor-changing actions so enable, disable, layout restore, layout save, and settings primary changes cannot overlap.
+- Added diagnostics logging for MultiMonitorTool detection failures before falling back to other detection paths.
+- Restored saved monitor rotation and resolution as part of saved-layout topology restoration.
+
 ## v0.3.5 - 2026-06-26
 
 ### Improved

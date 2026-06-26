@@ -9,6 +9,8 @@ namespace WorkMonitorSwitcher.Services
 {
     internal readonly record struct DisplayPosition(int X, int Y);
 
+    internal readonly record struct DisplaySize(int Width, int Height);
+
     internal sealed record DisplaySourceLayout(
         string DeviceName,
         int SourceModeIndex,
@@ -129,13 +131,13 @@ namespace WorkMonitorSwitcher.Services
 
             try
             {
-                var savedPositions = ReadSavedLayoutPositions(layoutPath);
-                if (savedPositions.Count == 0)
+                var savedLayouts = ReadSavedLayoutSettings(layoutPath);
+                if (savedLayouts.Count == 0)
                     return Failure("Saved layout file does not contain monitor positions.");
 
                 var snapshot = QueryActiveTopology();
                 var missing = snapshot.Entries
-                    .Where(e => !savedPositions.ContainsKey(e.Name))
+                    .Where(e => !savedLayouts.ContainsKey(e.Name))
                     .Select(e => e.Name)
                     .ToList();
                 if (missing.Count > 0)
@@ -143,24 +145,36 @@ namespace WorkMonitorSwitcher.Services
 
                 var positions = snapshot.Entries.ToDictionary(
                     e => e.SourceModeIndex,
-                    e => savedPositions[e.Name]);
+                    e => savedLayouts[e.Name].Position);
+                var sizes = snapshot.Entries
+                    .Where(e => savedLayouts[e.Name].Size.HasValue)
+                    .ToDictionary(
+                        e => e.SourceModeIndex,
+                        e => savedLayouts[e.Name].Size!.Value);
+                var rotations = snapshot.Entries
+                    .Where(e => savedLayouts[e.Name].Rotation.HasValue)
+                    .ToDictionary(
+                        e => e.SourceModeIndex,
+                        e => savedLayouts[e.Name].Rotation!.Value);
 
                 var primary = snapshot.Entries.FirstOrDefault(e =>
                 {
-                    var p = savedPositions[e.Name];
+                    var p = savedLayouts[e.Name].Position;
                     return p.X == 0 && p.Y == 0;
-                }) ?? snapshot.Entries.OrderBy(e => savedPositions[e.Name].X).First();
+                }) ?? snapshot.Entries.OrderBy(e => savedLayouts[e.Name].Position.X).First();
 
                 var orderedEntries = snapshot.Entries
                     .OrderBy(e => ReferenceEquals(e, primary) ? 0 : 1)
-                    .ThenBy(e => savedPositions[e.Name].X)
+                    .ThenBy(e => savedLayouts[e.Name].Position.X)
                     .ToList();
 
                 return ValidateAndApply(
                     snapshot,
                     orderedEntries,
                     positions,
-                    $"Applied saved layout positions from '{layoutPath}'.");
+                    $"Applied saved layout positions from '{layoutPath}'.",
+                    sizes,
+                    rotations);
             }
             catch (Exception ex)
             {
@@ -204,21 +218,47 @@ namespace WorkMonitorSwitcher.Services
             TopologySnapshot snapshot,
             IReadOnlyList<PathEntry> orderedEntries,
             IReadOnlyDictionary<int, DisplayPosition> positions,
-            string successMessage)
+            string successMessage,
+            IReadOnlyDictionary<int, DisplaySize>? sizes = null,
+            IReadOnlyDictionary<int, uint>? rotations = null)
         {
             foreach (var kv in positions)
             {
                 var source = snapshot.Modes[kv.Key].modeInfo.sourceMode;
                 source.position = new POINTL { x = kv.Value.X, y = kv.Value.Y };
+                if (sizes != null && sizes.TryGetValue(kv.Key, out var size))
+                {
+                    source.width = checked((uint)size.Width);
+                    source.height = checked((uint)size.Height);
+                }
                 snapshot.Modes[kv.Key].modeInfo.sourceMode = source;
             }
 
             var paths = orderedEntries.Select(e => e.Path).ToArray();
+            if (rotations != null)
+            {
+                for (int i = 0; i < paths.Length; i++)
+                {
+                    var sourceModeIndex = orderedEntries[i].SourceModeIndex;
+                    if (!rotations.TryGetValue(sourceModeIndex, out var rotation))
+                        continue;
+
+                    var target = paths[i].targetInfo;
+                    target.rotation = rotation;
+                    paths[i].targetInfo = target;
+                }
+            }
+
             var details = orderedEntries
                 .Select(e =>
                 {
                     var p = positions[e.SourceModeIndex];
-                    return $"{e.Name}: {e.X},{e.Y} -> {p.X},{p.Y}";
+                    var parts = new List<string> { $"{e.Name}: {e.X},{e.Y} -> {p.X},{p.Y}" };
+                    if (sizes != null && sizes.TryGetValue(e.SourceModeIndex, out var size))
+                        parts.Add($"size {e.Width}x{e.Height} -> {size.Width}x{size.Height}");
+                    if (rotations != null && rotations.TryGetValue(e.SourceModeIndex, out var rotation))
+                        parts.Add($"rotation {e.Rotation} -> {rotation}");
+                    return string.Join("; ", parts);
                 })
                 .ToList();
 
@@ -301,7 +341,8 @@ namespace WorkMonitorSwitcher.Services
                         X = source.position.x,
                         Y = source.position.y,
                         Width = checked((int)source.width),
-                        Height = checked((int)source.height)
+                        Height = checked((int)source.height),
+                        Rotation = paths[i].targetInfo.rotation
                     });
                 }
 
@@ -355,17 +396,28 @@ namespace WorkMonitorSwitcher.Services
             return request.viewGdiDeviceName ?? string.Empty;
         }
 
-        private static Dictionary<string, DisplayPosition> ReadSavedLayoutPositions(string layoutPath)
+        private static Dictionary<string, SavedDisplayLayout> ReadSavedLayoutSettings(string layoutPath)
         {
-            var positions = new Dictionary<string, DisplayPosition>(StringComparer.OrdinalIgnoreCase);
+            var layouts = new Dictionary<string, SavedDisplayLayout>(StringComparer.OrdinalIgnoreCase);
             string? name = null;
             int? x = null;
             int? y = null;
+            int? width = null;
+            int? height = null;
+            uint? rotation = null;
 
             void Commit()
             {
                 if (!string.IsNullOrWhiteSpace(name) && x.HasValue && y.HasValue)
-                    positions[name] = new DisplayPosition(x.Value, y.Value);
+                {
+                    var size = width.HasValue && height.HasValue
+                        ? new DisplaySize(width.Value, height.Value)
+                        : (DisplaySize?)null;
+                    layouts[name] = new SavedDisplayLayout(
+                        new DisplayPosition(x.Value, y.Value),
+                        size,
+                        rotation);
+                }
             }
 
             foreach (var rawLine in File.ReadLines(layoutPath))
@@ -381,6 +433,9 @@ namespace WorkMonitorSwitcher.Services
                     name = null;
                     x = null;
                     y = null;
+                    width = null;
+                    height = null;
+                    rotation = null;
                     continue;
                 }
 
@@ -404,10 +459,42 @@ namespace WorkMonitorSwitcher.Services
                 {
                     y = parsedY;
                 }
+                else if (key.Equals("Width", StringComparison.OrdinalIgnoreCase) &&
+                         int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedWidth))
+                {
+                    width = parsedWidth;
+                }
+                else if (key.Equals("Height", StringComparison.OrdinalIgnoreCase) &&
+                         int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedHeight))
+                {
+                    height = parsedHeight;
+                }
+                else if (key.Equals("DisplayOrientation", StringComparison.OrdinalIgnoreCase) &&
+                         int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedOrientation) &&
+                         TryMapDisplayOrientationToCcdRotation(parsedOrientation, out var parsedRotation))
+                {
+                    rotation = parsedRotation;
+                }
             }
 
             Commit();
-            return positions;
+            return layouts;
+        }
+
+        internal static bool TryMapDisplayOrientationToCcdRotation(int orientation, out uint rotation)
+        {
+            // MultiMonitorTool stores the same values as DEVMODE.dmDisplayOrientation.
+            // CCD rotation uses 1-based DISPLAYCONFIG_ROTATION values.
+            rotation = orientation switch
+            {
+                0 => 1, // identity / landscape
+                1 => 2, // 90 degrees
+                2 => 3, // 180 degrees
+                3 => 4, // 270 degrees
+                _ => 0
+            };
+
+            return rotation != 0;
         }
 
         private static bool DeviceNameEquals(string left, string right)
@@ -435,10 +522,16 @@ namespace WorkMonitorSwitcher.Services
             public int Y { get; init; }
             public int Width { get; init; }
             public int Height { get; init; }
+            public uint Rotation { get; init; }
 
             public DisplaySourceLayout ToLayout()
                 => new(Name, SourceModeIndex, X, Y, Width, Height);
         }
+
+        private sealed record SavedDisplayLayout(
+            DisplayPosition Position,
+            DisplaySize? Size,
+            uint? Rotation);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct LUID

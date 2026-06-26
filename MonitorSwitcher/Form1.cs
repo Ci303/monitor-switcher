@@ -78,6 +78,7 @@ namespace WorkMonitorSwitcher
 
         // Tracks rows currently executing a tool command
         private readonly HashSet<string> _busy = new(StringComparer.OrdinalIgnoreCase);
+        private readonly SemaphoreSlim _displayActionGate = new(1, 1);
         private bool _exitRequested;
         private bool _restoringFromTray;
         private bool _isRefreshingUi;
@@ -139,7 +140,7 @@ namespace WorkMonitorSwitcher
             _aliasStore = new AliasStore(_appDataDir);
             _profileStore = new LayoutProfileStore(_appDataDir, _layoutPath);
             _log = new DiagnosticsLog(_appDataDir);
-            _detectSvc = new DetectionService(_toolPath);
+            _detectSvc = new DetectionService(_toolPath, _log.Write);
             _layoutSvc = new LayoutService(_toolPath);
             _topologySvc = new DisplayTopologyService();
 
@@ -660,28 +661,46 @@ namespace WorkMonitorSwitcher
 
         private void SaveSelectedLayoutProfile()
         {
+            if (_displayActionGate.CurrentCount == 0)
+            {
+                ThemedMessageBox.Info(this,
+                    "Another monitor action is already running. Wait for it to finish, then save the layout again.",
+                    "Monitor Switcher", _uiSettings.DarkMode);
+                return;
+            }
+
             var profile = PromptForLayoutProfileName(SelectedLayoutProfileName());
             if (string.IsNullOrWhiteSpace(profile))
                 return;
 
-            var path = _profileStore.GetLayoutPath(profile);
-            var ok = _layoutSvc.SaveLayout(path);
-            _log.Write(ok
-                ? $"Saved layout profile '{profile}' to {path}."
-                : $"Failed to save layout profile '{profile}'. MultiMonitorTool present: {File.Exists(_toolPath)}.");
-
-            if (!ok)
-            {
-                ThemedMessageBox.Info(this,
-                    "Unable to save layout. Is MultiMonitorTool.exe present?",
-                    "Save Layout", _uiSettings.DarkMode);
+            if (!TryBeginDisplayAction("save layout"))
                 return;
-            }
 
-            _profileStore.AddProfileName(profile);
-            _uiSettings.SelectedLayoutProfile = profile;
-            _uiStore.Save(_uiSettings);
-            ThemedMessageBox.Info(this, $"Layout profile '{profile}' saved.", "Save Layout", _uiSettings.DarkMode);
+            try
+            {
+                var path = _profileStore.GetLayoutPath(profile);
+                var ok = _layoutSvc.SaveLayout(path);
+                _log.Write(ok
+                    ? $"Saved layout profile '{profile}' to {path}."
+                    : $"Failed to save layout profile '{profile}'. MultiMonitorTool present: {File.Exists(_toolPath)}.");
+
+                if (!ok)
+                {
+                    ThemedMessageBox.Info(this,
+                        "Unable to save layout. Is MultiMonitorTool.exe present?",
+                        "Save Layout", _uiSettings.DarkMode);
+                    return;
+                }
+
+                _profileStore.AddProfileName(profile);
+                _uiSettings.SelectedLayoutProfile = profile;
+                _uiStore.Save(_uiSettings);
+                ThemedMessageBox.Info(this, $"Layout profile '{profile}' saved.", "Save Layout", _uiSettings.DarkMode);
+            }
+            finally
+            {
+                EndDisplayAction("save layout");
+            }
         }
 
         private string? PromptForLayoutProfileName(string currentName)
@@ -729,33 +748,43 @@ namespace WorkMonitorSwitcher
 
         private async Task RestoreSelectedLayoutProfileAsync(bool showMessage)
         {
-            var profile = SelectedLayoutProfileName();
-            var path = _profileStore.GetLayoutPath(profile);
-            var ok = _layoutSvc.LoadLayout(path);
-            _log.Write(ok
-                ? $"Restored layout profile '{profile}' from {path}."
-                : $"Failed to restore layout profile '{profile}' from {path}.");
-
-            if (!ok)
-            {
-                if (showMessage)
-                    ThemedMessageBox.Warn(this,
-                        $"Unable to restore layout profile '{profile}'. Save it first and confirm MultiMonitorTool.exe is present.",
-                        "Restore Layout", _uiSettings.DarkMode);
+            if (!TryBeginDisplayAction("restore layout"))
                 return;
-            }
 
-            await Task.Delay(800);
-            await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
-            RefreshMonitorsAndUi();
-            if (EnforcePreferredPrimaryIfActive("preferred primary after layout restore"))
+            try
             {
-                await Task.Delay(400);
-                RefreshMonitorsAndUi();
-            }
+                var profile = SelectedLayoutProfileName();
+                var path = _profileStore.GetLayoutPath(profile);
+                var ok = _layoutSvc.LoadLayout(path);
+                _log.Write(ok
+                    ? $"Restored layout profile '{profile}' from {path}."
+                    : $"Failed to restore layout profile '{profile}' from {path}.");
 
-            if (showMessage)
-                ThemedMessageBox.Info(this, $"Layout profile '{profile}' restored.", "Restore Layout", _uiSettings.DarkMode);
+                if (!ok)
+                {
+                    if (showMessage)
+                        ThemedMessageBox.Warn(this,
+                            $"Unable to restore layout profile '{profile}'. Save it first and confirm MultiMonitorTool.exe is present.",
+                            "Restore Layout", _uiSettings.DarkMode);
+                    return;
+                }
+
+                await Task.Delay(800);
+                await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
+                RefreshMonitorsAndUi();
+                if (EnforcePreferredPrimaryIfActive("preferred primary after layout restore"))
+                {
+                    await Task.Delay(400);
+                    RefreshMonitorsAndUi();
+                }
+
+                if (showMessage)
+                    ThemedMessageBox.Info(this, $"Layout profile '{profile}' restored.", "Restore Layout", _uiSettings.DarkMode);
+            }
+            finally
+            {
+                EndDisplayAction("restore layout");
+            }
         }
 
         private async Task<DisplayTopologyResult> ApplySavedLayoutTopologyWithRetryAsync(string profile, string path)
@@ -822,6 +851,14 @@ namespace WorkMonitorSwitcher
         // ---------- Settings dialog ----------
         private async void SettingsButton_Click(object? sender, EventArgs e)
         {
+            if (_displayActionGate.CurrentCount == 0)
+            {
+                ThemedMessageBox.Info(this,
+                    "Another monitor action is already running. Wait for it to finish, then open Settings again.",
+                    "Monitor Switcher", _uiSettings.DarkMode);
+                return;
+            }
+
             if (!Visible || WindowState == FormWindowState.Minimized || !ShowInTaskbar)
                 ShowMainWindowForInteraction();
 
@@ -880,54 +917,84 @@ namespace WorkMonitorSwitcher
 
         private async Task ApplySettingsDialogResultsAsync(AliasSettingsForm dlg)
         {
-            AliasSettingsMapper.ApplyMonitorSettings(
-                _aliasMap,
-                dlg.RemovedKeys,
-                dlg.UpdatedMappings,
-                dlg.PreferredPrimaryKey,
-                dlg.FallbackPrimaryKey);
-            _aliasStore.Save(_aliasMap);
+            if (!TryBeginDisplayAction("apply settings"))
+                return;
 
-            if (dlg.DarkModeResult.HasValue && dlg.DarkModeResult.Value != _uiSettings.DarkMode)
+            try
             {
-                _uiSettings.DarkMode = dlg.DarkModeResult.Value;
+                AliasSettingsMapper.ApplyMonitorSettings(
+                    _aliasMap,
+                    dlg.RemovedKeys,
+                    dlg.UpdatedMappings,
+                    dlg.PreferredPrimaryKey,
+                    dlg.FallbackPrimaryKey);
+                _aliasStore.Save(_aliasMap);
+
+                if (dlg.DarkModeResult.HasValue && dlg.DarkModeResult.Value != _uiSettings.DarkMode)
+                {
+                    _uiSettings.DarkMode = dlg.DarkModeResult.Value;
+                    _uiStore.Save(_uiSettings);
+                    ApplyTheme(_uiSettings.DarkMode);
+                }
+
+                if (dlg.AlwaysOnTopResult.HasValue && dlg.AlwaysOnTopResult.Value != _uiSettings.AlwaysOnTop)
+                {
+                    _uiSettings.AlwaysOnTop = dlg.AlwaysOnTopResult.Value;
+                    _uiStore.Save(_uiSettings);
+                    TopMost = _uiSettings.AlwaysOnTop;
+                }
+
+                if (dlg.MinimizeToTrayResult.HasValue)
+                    _uiSettings.MinimizeToTray = dlg.MinimizeToTrayResult.Value;
+
+                if (dlg.StartWithWindowsResult.HasValue)
+                {
+                    _uiSettings.StartWithWindows = dlg.StartWithWindowsResult.Value;
+                    StartupManager.SetEnabled(_uiSettings.StartWithWindows, Application.ExecutablePath);
+                }
+
+                if (dlg.ConfirmBeforeDisableResult.HasValue)
+                    _uiSettings.ConfirmBeforeDisable = dlg.ConfirmBeforeDisableResult.Value;
+
+                if (!string.IsNullOrWhiteSpace(dlg.SelectedLayoutProfileResult))
+                    _uiSettings.SelectedLayoutProfile = dlg.SelectedLayoutProfileResult;
+
+                foreach (var profile in dlg.RemovedLayoutProfiles)
+                    _profileStore.DeleteProfile(profile);
+
                 _uiStore.Save(_uiSettings);
-                ApplyTheme(_uiSettings.DarkMode);
-            }
 
-            if (dlg.AlwaysOnTopResult.HasValue && dlg.AlwaysOnTopResult.Value != _uiSettings.AlwaysOnTop)
-            {
-                _uiSettings.AlwaysOnTop = dlg.AlwaysOnTopResult.Value;
-                _uiStore.Save(_uiSettings);
-                TopMost = _uiSettings.AlwaysOnTop;
-            }
-
-            if (dlg.MinimizeToTrayResult.HasValue)
-                _uiSettings.MinimizeToTray = dlg.MinimizeToTrayResult.Value;
-
-            if (dlg.StartWithWindowsResult.HasValue)
-            {
-                _uiSettings.StartWithWindows = dlg.StartWithWindowsResult.Value;
-                StartupManager.SetEnabled(_uiSettings.StartWithWindows, Application.ExecutablePath);
-            }
-
-            if (dlg.ConfirmBeforeDisableResult.HasValue)
-                _uiSettings.ConfirmBeforeDisable = dlg.ConfirmBeforeDisableResult.Value;
-
-            if (!string.IsNullOrWhiteSpace(dlg.SelectedLayoutProfileResult))
-                _uiSettings.SelectedLayoutProfile = dlg.SelectedLayoutProfileResult;
-
-            foreach (var profile in dlg.RemovedLayoutProfiles)
-                _profileStore.DeleteProfile(profile);
-
-            _uiStore.Save(_uiSettings);
-
-            RefreshMonitorsAndUi();
-            if (EnforcePreferredPrimaryIfActive("preferred primary after settings save"))
-            {
-                await Task.Delay(400);
                 RefreshMonitorsAndUi();
+                if (EnforcePreferredPrimaryIfActive("preferred primary after settings save"))
+                {
+                    await Task.Delay(400);
+                    RefreshMonitorsAndUi();
+                }
             }
+            finally
+            {
+                EndDisplayAction("apply settings");
+            }
+        }
+
+        private bool TryBeginDisplayAction(string actionName)
+        {
+            if (_displayActionGate.Wait(0))
+            {
+                _log.Write($"Display action started: {actionName}.");
+                return true;
+            }
+
+            ThemedMessageBox.Info(this,
+                "Another monitor action is already running. Wait for it to finish, then try again.",
+                "Monitor Switcher", _uiSettings.DarkMode);
+            return false;
+        }
+
+        private void EndDisplayAction(string actionName)
+        {
+            _log.Write($"Display action finished: {actionName}.");
+            _displayActionGate.Release();
         }
 
         // ---------- Working change ----------
@@ -1318,84 +1385,119 @@ namespace WorkMonitorSwitcher
                     return;
             }
 
-            var target = MonitorTargetResolver.ResolveDisableTargetArg(stableKey, _detected, _aliasMap);
-            if (string.IsNullOrWhiteSpace(target))
-            {
-                LogMonitorAction($"DISABLE {stableKey}: no target resolved.");
-                ThemedMessageBox.Info(this,
-                    "Cannot disable: no resolvable device identifier for this monitor.",
-                    "Monitor Switcher", _uiSettings.DarkMode);
+            if (!TryBeginDisplayAction("disable monitor"))
                 return;
-            }
-            LogMonitorAction($"DISABLE {stableKey}: selected target '{target}'.");
-            _log.Write($"Disable requested for '{GetAliasFor(stableKey)}' using target '{target}'.");
-
-            var disablingDevice = TryGetDeviceNameForStableKey(stableKey);
-
-            // Show WORKING… and lock the row
-            SetRowBusy(stableKey, true);
-            UpdateButtonStatus();
-
-            bool disabledByTopology = false;
-            bool failedBeforeDisable = false;
 
             try
             {
-                // Capture baseline layout before any primary-monitor topology change.
-                bool allActiveNow = _detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive);
-                if (allActiveNow) _layoutSvc.SaveLayout(SelectedLayoutPath());
-
-                if (!string.IsNullOrWhiteSpace(disablingDevice))
+                var target = MonitorTargetResolver.ResolveDisableTargetArg(stableKey, _detected, _aliasMap);
+                if (string.IsNullOrWhiteSpace(target))
                 {
-                    MoveWindowIfHostedOn(disablingDevice);
-                    await Task.Delay(100);
+                    LogMonitorAction($"DISABLE {stableKey}: no target resolved.");
+                    ThemedMessageBox.Info(this,
+                        "Cannot disable: no resolvable device identifier for this monitor.",
+                        "Monitor Switcher", _uiSettings.DarkMode);
+                    return;
+                }
+                LogMonitorAction($"DISABLE {stableKey}: selected target '{target}'.");
+                _log.Write($"Disable requested for '{GetAliasFor(stableKey)}' using target '{target}'.");
 
-                    var primaryDisable = await DisablePrimaryUsingTopologyIfNeededAsync(disablingDevice);
-                    if (primaryDisable.Attempted)
+                var disablingDevice = TryGetDeviceNameForStableKey(stableKey);
+
+                // Show WORKING… and lock the row
+                SetRowBusy(stableKey, true);
+                UpdateButtonStatus();
+
+                bool disabledByTopology = false;
+                bool disabledByTool = false;
+                bool failedBeforeDisable = false;
+
+                try
+                {
+                    // Capture baseline layout before any primary-monitor topology change.
+                    bool allActiveNow = _detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive);
+                    if (allActiveNow) _layoutSvc.SaveLayout(SelectedLayoutPath());
+
+                    if (!string.IsNullOrWhiteSpace(disablingDevice))
                     {
-                        if (!primaryDisable.Success)
+                        MoveWindowIfHostedOn(disablingDevice);
+                        await Task.Delay(100);
+
+                        var primaryDisable = await DisablePrimaryUsingTopologyIfNeededAsync(disablingDevice);
+                        if (primaryDisable.Attempted)
                         {
-                            failedBeforeDisable = true;
+                            if (!primaryDisable.Success)
+                            {
+                                failedBeforeDisable = true;
+                                ThemedMessageBox.Error(this,
+                                    primaryDisable.ErrorMessage,
+                                    "Monitor Switcher", _uiSettings.DarkMode);
+                            }
+                            else
+                            {
+                                disabledByTopology = true;
+                            }
+                        }
+                    }
+
+                    if (!failedBeforeDisable && !disabledByTopology)
+                    {
+                        var res = await ExecToolAsync("/disable", target);
+                        LogMonitorAction($"DISABLE {stableKey}: exit={res.ExitCode}, stderr='{res.StdErr}'.");
+                        _log.Write($"Disable result for '{GetAliasFor(stableKey)}': exit={res.ExitCode}, stderr='{res.StdErr}'.");
+
+                        var detectedAfterTool = await WaitForDisableDetectionAsync(stableKey);
+                        disabledByTool = !MonitorTargetResolver.IsStableKeyActive(detectedAfterTool, stableKey);
+
+                        if (!disabledByTool && !string.IsNullOrWhiteSpace(disablingDevice))
+                        {
+                            _log.Write(
+                                $"Disable for '{GetAliasFor(stableKey)}' left the monitor active after MultiMonitorTool exit {res.ExitCode}; trying CCD topology fallback.");
+
+                            var fallbackDisable = await DisableUsingTopologyAsync(
+                                disablingDevice,
+                                "CCD disable fallback after MultiMonitorTool");
+
+                            disabledByTopology = fallbackDisable.Success;
+                            if (!fallbackDisable.Success)
+                            {
+                                ThemedMessageBox.Error(this,
+                                    $"Disable failed. MultiMonitorTool exit {res.ExitCode}; {fallbackDisable.ErrorMessage}" +
+                                    (string.IsNullOrWhiteSpace(res.StdErr) ? string.Empty : $"\n{res.StdErr}"),
+                                    "Monitor Switcher", _uiSettings.DarkMode);
+                            }
+                        }
+                        else if (!disabledByTool)
+                        {
                             ThemedMessageBox.Error(this,
-                                primaryDisable.ErrorMessage,
+                                $"Disable failed (exit {res.ExitCode})." +
+                                (string.IsNullOrWhiteSpace(res.StdErr) ? string.Empty : $"\n{res.StdErr}"),
                                 "Monitor Switcher", _uiSettings.DarkMode);
                         }
-                        else
-                        {
-                            disabledByTopology = true;
-                        }
                     }
-                }
-
-                if (!failedBeforeDisable && !disabledByTopology)
-                {
-                    var res = await ExecToolAsync("/disable", target);
-                    LogMonitorAction($"DISABLE {stableKey}: exit={res.ExitCode}, stderr='{res.StdErr}'.");
-                    _log.Write($"Disable result for '{GetAliasFor(stableKey)}': exit={res.ExitCode}, stderr='{res.StdErr}'.");
-
-                    if (res.ExitCode != 0)
+                    else if (disabledByTopology)
                     {
-                        ThemedMessageBox.Error(this,
-                            $"Disable failed (exit {res.ExitCode})." +
-                            (string.IsNullOrWhiteSpace(res.StdErr) ? string.Empty : $"\n{res.StdErr}"),
-                            "Monitor Switcher", _uiSettings.DarkMode);
+                        LogMonitorAction($"DISABLE {stableKey}: completed by CCD topology update.");
+                        _log.Write($"Disable result for '{GetAliasFor(stableKey)}': completed by CCD topology update.");
                     }
+
+                    if (disabledByTool)
+                        _log.Write($"Disable result for '{GetAliasFor(stableKey)}': monitor inactive after MultiMonitorTool command.");
+
+                    // Give the desktop a brief moment to settle.
+                    await Task.Delay(400);
                 }
-                else if (disabledByTopology)
+                finally
                 {
-                    LogMonitorAction($"DISABLE {stableKey}: completed by CCD topology update.");
-                    _log.Write($"Disable result for '{GetAliasFor(stableKey)}': completed by CCD topology update.");
+                    SetRowBusy(stableKey, false);
                 }
 
-                // Give the desktop a brief moment to settle.
-                await Task.Delay(400);
+                RefreshMonitorsAndUi();
             }
             finally
             {
-                SetRowBusy(stableKey, false);
+                EndDisplayAction("disable monitor");
             }
-
-            RefreshMonitorsAndUi();
         }
 
         private async Task<PrimaryDisableAttempt> DisablePrimaryUsingTopologyIfNeededAsync(string disablingDevice)
@@ -1405,20 +1507,32 @@ namespace WorkMonitorSwitcher
                 !primary.DeviceName.Equals(disablingDevice, StringComparison.OrdinalIgnoreCase))
                 return new PrimaryDisableAttempt { Attempted = false, Success = true };
 
-            var fallback = GetFallbackActiveScreen(disablingDevice);
+            var result = await DisableUsingTopologyAsync(disablingDevice, $"CCD primary disable {disablingDevice}");
+
+            return new PrimaryDisableAttempt
+            {
+                Attempted = true,
+                Success = result.Success,
+                ErrorMessage = result.ErrorMessage
+            };
+        }
+
+        private async Task<PrimaryDisableAttempt> DisableUsingTopologyAsync(string disablingDevice, string logAction)
+        {
+            var fallback = GetTopologyFallbackScreenForDisable(disablingDevice);
             if (fallback.DeviceName.Equals(disablingDevice, StringComparison.OrdinalIgnoreCase))
             {
                 return new PrimaryDisableAttempt
                 {
                     Attempted = true,
                     Success = false,
-                    ErrorMessage = "Cannot disable the primary monitor because no fallback monitor is available."
+                    ErrorMessage = "Cannot disable the monitor because no fallback monitor is available."
                 };
             }
 
-            _log.Write($"Disabling primary monitor {disablingDevice} with fallback primary {fallback.DeviceName}.");
+            _log.Write($"Disabling monitor {disablingDevice} with fallback primary {fallback.DeviceName}.");
             var result = _topologySvc.DisableDisplayUsingFallbackPrimary(disablingDevice, fallback.DeviceName);
-            LogTopologyResult($"CCD primary disable {disablingDevice}", result);
+            LogTopologyResult(logAction, result);
             await Task.Delay(700);
 
             return new PrimaryDisableAttempt
@@ -1431,46 +1545,73 @@ namespace WorkMonitorSwitcher
             };
         }
 
+        private Screen GetTopologyFallbackScreenForDisable(string disablingDevice)
+        {
+            var primary = Screen.PrimaryScreen;
+            if (primary != null &&
+                !primary.DeviceName.Equals(disablingDevice, StringComparison.OrdinalIgnoreCase))
+            {
+                return primary;
+            }
+
+            return GetFallbackActiveScreen(disablingDevice);
+        }
+
 
         private async void ButtonOn_Click(object? sender, EventArgs e)
         {
             if (sender is not Button btn || btn.Tag is not string stableKey) return;
 
-            var enableTargets = MonitorTargetResolver.ResolveEnableTargetArgs(stableKey, _detected, _aliasMap).ToList();
-            if (enableTargets.Count == 0)
-            {
-                LogMonitorAction($"ENABLE {stableKey}: no targets resolved.");
-                ThemedMessageBox.Info(this,
-                    "Cannot enable: no resolvable monitor identifiers for this monitor. Toggle another display on, then press Refresh.",
-                    "Monitor Switcher", _uiSettings.DarkMode);
+            if (!TryBeginDisplayAction("enable monitor"))
                 return;
-            }
-            LogMonitorAction($"ENABLE {stableKey}: candidate targets [{string.Join(", ", enableTargets.Select(t => $"'{t}'"))}].");
-            _log.Write($"Enable requested for '{GetAliasFor(stableKey)}' with {enableTargets.Count} candidate target(s).");
 
-            // Show WORKING… and lock the row
-            SetRowBusy(stableKey, true);
-            UpdateButtonStatus();
-
-            var attempt = await TryEnableMonitorTargetsAsync(stableKey, enableTargets);
-
-            // Clear busy
-            SetRowBusy(stableKey, false);
-
-            if (!attempt.Success)
+            try
             {
-                LogMonitorAction($"ENABLE {stableKey}: all target attempts failed.");
-                ThemedMessageBox.Error(this,
-                    $"Enable failed to activate the selected monitor." +
-                    (attempt.LastResult == null ? string.Empty : $" (last exit {attempt.LastResult.ExitCode}).") +
-                    (string.IsNullOrWhiteSpace(attempt.LastResult?.StdErr) ? string.Empty : $"\n{attempt.LastResult!.StdErr}"),
-                    "Monitor Switcher", _uiSettings.DarkMode);
+                var enableTargets = MonitorTargetResolver.ResolveEnableTargetArgs(stableKey, _detected, _aliasMap).ToList();
+                if (enableTargets.Count == 0)
+                {
+                    LogMonitorAction($"ENABLE {stableKey}: no targets resolved.");
+                    ThemedMessageBox.Info(this,
+                        "Cannot enable: no resolvable monitor identifiers for this monitor. Toggle another display on, then press Refresh.",
+                        "Monitor Switcher", _uiSettings.DarkMode);
+                    return;
+                }
+                LogMonitorAction($"ENABLE {stableKey}: candidate targets [{string.Join(", ", enableTargets.Select(t => $"'{t}'"))}].");
+                _log.Write($"Enable requested for '{GetAliasFor(stableKey)}' with {enableTargets.Count} candidate target(s).");
 
-                RefreshMonitorsAndUi();
-                return;
+                // Show WORKING… and lock the row
+                SetRowBusy(stableKey, true);
+                UpdateButtonStatus();
+
+                EnableAttemptResult attempt;
+                try
+                {
+                    attempt = await TryEnableMonitorTargetsAsync(stableKey, enableTargets);
+                }
+                finally
+                {
+                    SetRowBusy(stableKey, false);
+                }
+
+                if (!attempt.Success)
+                {
+                    LogMonitorAction($"ENABLE {stableKey}: all target attempts failed.");
+                    ThemedMessageBox.Error(this,
+                        $"Enable failed to activate the selected monitor." +
+                        (attempt.LastResult == null ? string.Empty : $" (last exit {attempt.LastResult.ExitCode}).") +
+                        (string.IsNullOrWhiteSpace(attempt.LastResult?.StdErr) ? string.Empty : $"\n{attempt.LastResult!.StdErr}"),
+                        "Monitor Switcher", _uiSettings.DarkMode);
+
+                    RefreshMonitorsAndUi();
+                    return;
+                }
+
+                await FinaliseSuccessfulEnableAsync();
             }
-
-            await FinaliseSuccessfulEnableAsync();
+            finally
+            {
+                EndDisplayAction("enable monitor");
+            }
         }
 
         private async Task<EnableAttemptResult> TryEnableMonitorTargetsAsync(string stableKey, List<string> enableTargets)
@@ -1569,6 +1710,22 @@ namespace WorkMonitorSwitcher
                 {
                     break;
                 }
+            }
+
+            return latest;
+        }
+
+        private async Task<List<DetectedMonitor>> WaitForDisableDetectionAsync(string stableKey)
+        {
+            var latest = new List<DetectedMonitor>();
+
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                await Task.Delay(500);
+                latest = _detectSvc.Detect();
+
+                if (!MonitorTargetResolver.IsStableKeyActive(latest, stableKey))
+                    break;
             }
 
             return latest;

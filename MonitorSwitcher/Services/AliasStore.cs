@@ -45,7 +45,7 @@ namespace WorkMonitorSwitcher.Services
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
                 var json = JsonSerializer.Serialize(map, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(_path, json);
+                AtomicFileWriter.WriteAllText(_path, json);
             }
             catch
             {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using WorkMonitorSwitcher.Model;
 using WorkMonitorSwitcher.Services;
@@ -14,9 +15,11 @@ var tests = new (string Name, Action Body)[]
     ("MonitorPresentationBuilder handles duplicate stable keys without throwing", PresentationBuilderHandlesDuplicateStableKeys),
     ("MonitorPresentationBuilder preserves disconnected detected state", PresentationBuilderPreservesDisconnectedState),
     ("DisplayTopologyService compacts remaining displays around the fallback primary", DisplayTopologyCompactsAroundFallbackPrimary),
+    ("DisplayTopologyService maps saved orientation to CCD rotation", DisplayTopologyMapsSavedOrientationToCcdRotation),
     ("AliasSettingsMapper applies aliases and primary selections", AliasSettingsMapperAppliesAliasesAndSelections),
     ("AliasSettingsMapper clears fallback when it matches preferred primary", AliasSettingsMapperClearsFallbackWhenItMatchesPreferredPrimary),
     ("PrimaryMonitorPreference resolves configured primary targets", PrimaryMonitorPreferenceResolvesConfiguredTargets),
+    ("AtomicFileWriter replaces existing files and keeps a backup", AtomicFileWriterReplacesExistingFilesAndKeepsBackup),
 };
 
 var failures = new List<string>();
@@ -221,6 +224,25 @@ static void DisplayTopologyCompactsAroundFallbackPrimary()
     AssertEquals(new DisplayPosition(2560, -1106), positions[3], "Expected right display to remain to the right with its vertical offset preserved.");
 }
 
+static void DisplayTopologyMapsSavedOrientationToCcdRotation()
+{
+    AssertTrue(DisplayTopologyService.TryMapDisplayOrientationToCcdRotation(0, out var identity),
+        "Expected landscape orientation to map.");
+    AssertTrue(DisplayTopologyService.TryMapDisplayOrientationToCcdRotation(1, out var rotate90),
+        "Expected 90-degree orientation to map.");
+    AssertTrue(DisplayTopologyService.TryMapDisplayOrientationToCcdRotation(2, out var rotate180),
+        "Expected 180-degree orientation to map.");
+    AssertTrue(DisplayTopologyService.TryMapDisplayOrientationToCcdRotation(3, out var rotate270),
+        "Expected 270-degree orientation to map.");
+
+    AssertEquals<uint>(1, identity, "Expected identity CCD rotation.");
+    AssertEquals<uint>(2, rotate90, "Expected 90-degree CCD rotation.");
+    AssertEquals<uint>(3, rotate180, "Expected 180-degree CCD rotation.");
+    AssertEquals<uint>(4, rotate270, "Expected 270-degree CCD rotation.");
+    AssertFalse(DisplayTopologyService.TryMapDisplayOrientationToCcdRotation(99, out _),
+        "Expected unknown orientation to be rejected.");
+}
+
 static void AliasSettingsMapperAppliesAliasesAndSelections()
 {
     var aliases = new Dictionary<string, MonitorInfo>(StringComparer.OrdinalIgnoreCase)
@@ -315,6 +337,29 @@ static void PrimaryMonitorPreferenceResolvesConfiguredTargets()
     AssertEquals("\\\\.\\DISPLAY1", fallback, "Expected configured fallback device to resolve.");
     AssertEquals<string?>(null, excludedFallback, "Expected excluded fallback device to be ignored.");
     AssertEquals("\\\\.\\DISPLAY1", automatic, "Expected left-most active monitor to be automatic fallback.");
+}
+
+static void AtomicFileWriterReplacesExistingFilesAndKeepsBackup()
+{
+    var dir = Path.Combine(Path.GetTempPath(), "MonitorSwitcher.Tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+
+    try
+    {
+        var path = Path.Combine(dir, "settings.json");
+        File.WriteAllText(path, "old");
+
+        AtomicFileWriter.WriteAllText(path, "new");
+
+        AssertEquals("new", File.ReadAllText(path), "Expected target file to contain replacement content.");
+        AssertTrue(File.Exists(path + ".bak"), "Expected a backup file to be created for replaced content.");
+        AssertEquals("old", File.ReadAllText(path + ".bak"), "Expected backup file to contain previous content.");
+    }
+    finally
+    {
+        if (Directory.Exists(dir))
+            Directory.Delete(dir, recursive: true);
+    }
 }
 
 static DetectedMonitor Monitor(

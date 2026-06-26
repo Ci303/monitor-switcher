@@ -18,10 +18,12 @@ namespace WorkMonitorSwitcher.Services
     internal sealed class DetectionService
     {
         private readonly string _toolPath;
+        private readonly Action<string>? _diagnosticsLog;
 
-        public DetectionService(string toolPath)
+        public DetectionService(string toolPath, Action<string>? diagnosticsLog = null)
         {
             _toolPath = toolPath;
+            _diagnosticsLog = diagnosticsLog;
         }
 
         /// <summary>
@@ -54,7 +56,7 @@ namespace WorkMonitorSwitcher.Services
                 ExecuteMonitorTool("/scomma", tmp);
                 if (!File.Exists(tmp)) return result;
 
-                var lines = ReadAllLinesBestEffort(tmp);
+                var lines = ReadAllLinesBestEffort(tmp, "CSV");
                 if (lines.Length < 2) return result;
 
                 var headers = SplitCsvLine(lines[0]);
@@ -100,8 +102,9 @@ namespace WorkMonitorSwitcher.Services
 
                 return result.Where(r => !string.IsNullOrWhiteSpace(r.DeviceName)).ToList();
             }
-            catch
+            catch (Exception ex)
             {
+                LogDetectionFailure($"CSV monitor detection failed: {ex.Message}");
                 return result;
             }
             finally
@@ -123,7 +126,7 @@ namespace WorkMonitorSwitcher.Services
                 ExecuteMonitorTool("/stext", tmp);
                 if (!File.Exists(tmp)) return result;
 
-                var lines = ReadAllLinesBestEffort(tmp);
+                var lines = ReadAllLinesBestEffort(tmp, "text");
                 DetectedMonitor? cur = null;
                 bool currentPresenceKnown = false;
 
@@ -183,8 +186,9 @@ namespace WorkMonitorSwitcher.Services
 
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
+                LogDetectionFailure($"Text monitor detection failed: {ex.Message}");
                 return result;
             }
             finally
@@ -239,11 +243,16 @@ namespace WorkMonitorSwitcher.Services
                 if (!process.WaitForExit(ToolTimeoutMs))
                 {
                     try { process.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                    LogDetectionFailure($"MultiMonitorTool {verb} timed out after {ToolTimeoutMs}ms.");
+                }
+                else if (process.ExitCode != 0)
+                {
+                    LogDetectionFailure($"MultiMonitorTool {verb} exited with code {process.ExitCode}.");
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // swallow; caller will fall back
+                LogDetectionFailure($"MultiMonitorTool {verb} failed: {ex.Message}");
             }
         }
 
@@ -330,7 +339,7 @@ namespace WorkMonitorSwitcher.Services
             return ParseInt(raw);
         }
 
-        private static string[] ReadAllLinesBestEffort(string path)
+        private string[] ReadAllLinesBestEffort(string path, string exportType)
         {
             try
             {
@@ -345,9 +354,22 @@ namespace WorkMonitorSwitcher.Services
 
                 return SplitLines(Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF'));
             }
+            catch (Exception ex)
+            {
+                LogDetectionFailure($"Unable to read {exportType} monitor detection export: {ex.Message}");
+                return Array.Empty<string>();
+            }
+        }
+
+        private void LogDetectionFailure(string message)
+        {
+            try
+            {
+                _diagnosticsLog?.Invoke(message);
+            }
             catch
             {
-                return Array.Empty<string>();
+                // Diagnostics must not affect monitor detection fallback.
             }
         }
 
