@@ -36,7 +36,7 @@ namespace WorkMonitorSwitcher
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
         };
 
-        private readonly Button _ok = new() { Text = "OK", DialogResult = DialogResult.OK, AutoSize = true };
+        private readonly Button _ok = new() { Text = "Save", DialogResult = DialogResult.OK, AutoSize = true };
         private readonly Button _cancel = new() { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
         private readonly Button _remove = new() { Text = "Remove Selected", AutoSize = true };
         private readonly Button _openRegistry = new() { Text = "Open Registry", AutoSize = true };
@@ -183,6 +183,8 @@ namespace WorkMonitorSwitcher
             };
             fallbackPrimaryCol.ThreeState = false;
 
+            NormalisePrimaryFallbackRows();
+
             _grid.Columns.Add(shortKeyCol);
             _grid.Columns.Add(regCol);
             _grid.Columns.Add(aliasCol);
@@ -194,6 +196,19 @@ namespace WorkMonitorSwitcher
             {
                 if (_grid.IsCurrentCellDirty)
                     _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            _grid.CellBeginEdit += (_, e) =>
+            {
+                if (IsFallbackPrimaryCell(e.RowIndex, e.ColumnIndex) &&
+                    _rows[e.RowIndex].IsPreferredPrimary)
+                {
+                    e.Cancel = true;
+                }
+            };
+            _grid.CellPainting += (_, e) =>
+            {
+                if (IsDisabledFallbackPrimaryCell(e.RowIndex, e.ColumnIndex))
+                    PaintDisabledFallbackCheckbox(e);
             };
 
             // Tooltip with full StableKey when hovering the first column
@@ -241,14 +256,26 @@ namespace WorkMonitorSwitcher
                         e.RowIndex,
                         row => row.IsPreferredPrimary,
                         (row, value) => row.IsPreferredPrimary = value);
+
+                    if (_rows[e.RowIndex].IsPreferredPrimary)
+                        _rows[e.RowIndex].IsFallbackPrimary = false;
                 }
                 else if (propertyName == nameof(AliasViewRow.IsFallbackPrimary))
                 {
+                    if (_rows[e.RowIndex].IsPreferredPrimary)
+                    {
+                        _rows[e.RowIndex].IsFallbackPrimary = false;
+                    }
+
                     KeepSingleCheckedRow(
                         e.RowIndex,
                         row => row.IsFallbackPrimary,
                         (row, value) => row.IsFallbackPrimary = value);
                 }
+
+                NormalisePrimaryFallbackRows();
+                UpdatePrimaryFallbackCellStates();
+                UpdateDetailsPanel();
             };
             _grid.CellDoubleClick += (_, e) =>
             {
@@ -380,6 +407,7 @@ namespace WorkMonitorSwitcher
             Controls.Add(profileBar);
             Controls.Add(bottom);
             FitInitialSizeToContent(topBar, profileBar, toolActions, commitActions, sizingOwner);
+            UpdatePrimaryFallbackCellStates();
 
             AcceptButton = _ok;
             CancelButton = _cancel;
@@ -392,6 +420,7 @@ namespace WorkMonitorSwitcher
             _ok.Click += (_, __) =>
             {
                 _grid.EndEdit();
+                NormalisePrimaryFallbackRows();
                 UpdatedMappings.Clear();
                 foreach (var row in _rows)
                     UpdatedMappings[row.StableKey] = row.Alias ?? string.Empty;
@@ -518,6 +547,8 @@ namespace WorkMonitorSwitcher
                 RemovedKeys.Add(_rows[rowIndex].StableKey);
                 _rows.RemoveAt(rowIndex);
             }
+
+            UpdatePrimaryFallbackCellStates();
             UpdateDetailsPanel();
         }
 
@@ -964,10 +995,151 @@ namespace WorkMonitorSwitcher
             // Title bar
             DwmInterop.SetDarkTitleBar(this.Handle, dark);
             BuildLayoutProfileMenu();
+            UpdatePrimaryFallbackCellStates();
 
             // We don’t set caption color here; leaving it to system accent avoids visual mismatch
             Invalidate(true);
             Update();
+        }
+
+        private bool IsFallbackPrimaryCell(int rowIndex, int columnIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= _rows.Count || columnIndex < 0 || columnIndex >= _grid.Columns.Count)
+                return false;
+
+            return _grid.Columns[columnIndex].DataPropertyName == nameof(AliasViewRow.IsFallbackPrimary);
+        }
+
+        private bool IsDisabledFallbackPrimaryCell(int rowIndex, int columnIndex)
+            => IsFallbackPrimaryCell(rowIndex, columnIndex) && _rows[rowIndex].IsPreferredPrimary;
+
+        private void PaintDisabledFallbackCheckbox(DataGridViewCellPaintingEventArgs e)
+        {
+            e.Handled = true;
+
+            var graphics = e.Graphics;
+            if (graphics == null)
+                return;
+
+            var palette = _chkDark.Checked ? ThemePalette.Dark() : ThemePalette.Light();
+            var selected = (e.State & DataGridViewElementStates.Selected) == DataGridViewElementStates.Selected;
+            var background = selected
+                ? ControlPaint.Light(palette.Surface, 0.08f)
+                : palette.Surface;
+
+            using (var back = new SolidBrush(background))
+                graphics.FillRectangle(back, e.CellBounds);
+
+            using (var border = new Pen(_grid.GridColor))
+            {
+                graphics.DrawLine(border, e.CellBounds.Left, e.CellBounds.Bottom - 1, e.CellBounds.Right - 1, e.CellBounds.Bottom - 1);
+                graphics.DrawLine(border, e.CellBounds.Right - 1, e.CellBounds.Top, e.CellBounds.Right - 1, e.CellBounds.Bottom - 1);
+            }
+
+            bool dark = _chkDark.Checked;
+            var boxFill = dark ? Color.FromArgb(58, 58, 58) : Color.FromArgb(222, 222, 222);
+            var boxBorder = dark ? Color.FromArgb(96, 96, 96) : Color.FromArgb(160, 160, 160);
+            var checkColor = dark ? Color.FromArgb(132, 132, 132) : Color.FromArgb(130, 130, 130);
+            const int boxSize = 14;
+            var boxBounds = new Rectangle(
+                e.CellBounds.Left + ((e.CellBounds.Width - boxSize) / 2),
+                e.CellBounds.Top + ((e.CellBounds.Height - boxSize) / 2),
+                boxSize,
+                boxSize);
+
+            using (var boxBack = new SolidBrush(boxFill))
+                graphics.FillRectangle(boxBack, boxBounds);
+            using (var boxPen = new Pen(boxBorder))
+                graphics.DrawRectangle(boxPen, boxBounds);
+
+            var isChecked = e.Value is bool value && value;
+            if (!isChecked)
+                return;
+
+            using var checkPen = new Pen(checkColor, 2f);
+            checkPen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+            checkPen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+            graphics.DrawLines(checkPen, new[]
+            {
+                new Point(boxBounds.Left + 3, boxBounds.Top + 7),
+                new Point(boxBounds.Left + 6, boxBounds.Top + 10),
+                new Point(boxBounds.Left + 11, boxBounds.Top + 4)
+            });
+        }
+
+        private void NormalisePrimaryFallbackRows()
+        {
+            string? preferredPrimaryKey = null;
+            string? fallbackPrimaryKey = null;
+
+            foreach (var row in _rows)
+            {
+                if (row.IsPreferredPrimary)
+                {
+                    if (preferredPrimaryKey == null)
+                    {
+                        preferredPrimaryKey = row.StableKey;
+                    }
+                    else
+                    {
+                        row.IsPreferredPrimary = false;
+                    }
+                }
+
+                if (row.IsPreferredPrimary && row.IsFallbackPrimary)
+                    row.IsFallbackPrimary = false;
+
+                if (row.IsFallbackPrimary)
+                {
+                    if (fallbackPrimaryKey == null)
+                    {
+                        fallbackPrimaryKey = row.StableKey;
+                    }
+                    else
+                    {
+                        row.IsFallbackPrimary = false;
+                    }
+                }
+            }
+        }
+
+        private void UpdatePrimaryFallbackCellStates()
+        {
+            var fallbackColumnIndex = FindColumnIndex(nameof(AliasViewRow.IsFallbackPrimary));
+            if (fallbackColumnIndex < 0 || _grid.Rows.Count == 0)
+                return;
+
+            var palette = _chkDark.Checked ? ThemePalette.Dark() : ThemePalette.Light();
+
+            for (int rowIndex = 0; rowIndex < _rows.Count && rowIndex < _grid.Rows.Count; rowIndex++)
+            {
+                var row = _rows[rowIndex];
+                var fallbackCell = _grid.Rows[rowIndex].Cells[fallbackColumnIndex];
+                var fallbackDisabled = row.IsPreferredPrimary;
+
+                fallbackCell.ReadOnly = fallbackDisabled;
+                fallbackCell.ToolTipText = fallbackDisabled
+                    ? "A primary monitor cannot also be the fallback primary."
+                    : string.Empty;
+                fallbackCell.Style.BackColor = fallbackDisabled ? palette.Surface : _grid.DefaultCellStyle.BackColor;
+                fallbackCell.Style.ForeColor = fallbackDisabled ? palette.TextSubtle : _grid.DefaultCellStyle.ForeColor;
+                fallbackCell.Style.SelectionBackColor = fallbackDisabled ? palette.Surface : _grid.DefaultCellStyle.SelectionBackColor;
+                fallbackCell.Style.SelectionForeColor = fallbackDisabled ? palette.TextSubtle : _grid.DefaultCellStyle.SelectionForeColor;
+            }
+
+            _grid.Refresh();
+            _grid.Invalidate();
+        }
+
+        private int FindColumnIndex(string propertyName)
+        {
+            foreach (DataGridViewColumn column in _grid.Columns)
+            {
+                if (column.DataPropertyName == propertyName)
+                    return column.Index;
+            }
+
+            return -1;
         }
 
         private sealed class LayoutProfileMenuRenderer : ToolStripProfessionalRenderer

@@ -354,20 +354,18 @@ namespace WorkMonitorSwitcher
         // Prefers the configured fallback primary, then the left-most active screen.
         private Screen GetFallbackActiveScreen(string? excludeDevice)
         {
-            var configuredFallback = TryGetConfiguredFallbackPrimaryScreen(excludeDevice);
-            if (configuredFallback != null)
-                return configuredFallback;
+            var configuredFallback = PrimaryMonitorPreference.ResolveConfiguredFallbackDeviceName(
+                excludeDevice,
+                _detected,
+                _aliasMap);
+            if (!string.IsNullOrWhiteSpace(configuredFallback))
+            {
+                var configuredScreen = TryGetScreenForDevice(configuredFallback);
+                if (configuredScreen != null)
+                    return configuredScreen;
+            }
 
-            var activeDevices = _detected
-                .Where(d => d.IsPresent && d.IsActive)
-                .Where(d => !string.IsNullOrWhiteSpace(d.DeviceName) &&
-                            !string.Equals(d.DeviceName, excludeDevice, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(d => d.PositionX)
-                .ThenBy(d => d.DeviceName, StringComparer.OrdinalIgnoreCase)
-                .Select(d => d.DeviceName)
-                .ToList();
-
-            foreach (var dev in activeDevices)
+            foreach (var dev in PrimaryMonitorPreference.ResolveAutomaticFallbackDeviceNames(excludeDevice, _detected))
             {
                 var scr = TryGetScreenForDevice(dev);
                 if (scr != null) return scr;
@@ -381,25 +379,6 @@ namespace WorkMonitorSwitcher
             var any = Screen.AllScreens.FirstOrDefault(s =>
                 !string.Equals(s.DeviceName, excludeDevice, StringComparison.OrdinalIgnoreCase));
             return any ?? (primary ?? Screen.AllScreens.First());
-        }
-
-        private Screen? TryGetConfiguredFallbackPrimaryScreen(string? excludeDevice)
-        {
-            var fallback = _aliasMap.FirstOrDefault(kv => kv.Value.IsFallbackPrimary);
-            if (string.IsNullOrWhiteSpace(fallback.Key))
-                return null;
-
-            var live = _detected.FirstOrDefault(d =>
-                d.StableKey.Equals(fallback.Key, StringComparison.OrdinalIgnoreCase) &&
-                d.IsPresent &&
-                d.IsActive &&
-                !string.IsNullOrWhiteSpace(d.DeviceName) &&
-                !string.Equals(d.DeviceName, excludeDevice, StringComparison.OrdinalIgnoreCase));
-
-            if (live == null)
-                return null;
-
-            return TryGetScreenForDevice(live.DeviceName);
         }
         // Center this window on the given screen's working area.
         // Temporarily drops TopMost to avoid z-order oddities while moving.
@@ -841,7 +820,7 @@ namespace WorkMonitorSwitcher
         }
 
         // ---------- Settings dialog ----------
-        private void SettingsButton_Click(object? sender, EventArgs e)
+        private async void SettingsButton_Click(object? sender, EventArgs e)
         {
             if (!Visible || WindowState == FormWindowState.Minimized || !ShowInTaskbar)
                 ShowMainWindowForInteraction();
@@ -881,54 +860,32 @@ namespace WorkMonitorSwitcher
             }
 
             if (dr == DialogResult.OK)
-                ApplySettingsDialogResults(dlg);
+            {
+                try
+                {
+                    await ApplySettingsDialogResultsAsync(dlg);
+                }
+                catch (Exception ex)
+                {
+                    ThemedMessageBox.Error(this,
+                        $"Unable to apply settings.\n{ex.Message}",
+                        "Monitor Switcher",
+                        _uiSettings.DarkMode);
+                }
+            }
         }
 
         private List<AliasViewRow> BuildAliasSettingsRows()
-            => BuildPresentationList()
-                .Select(d =>
-                {
-                    var alias = GetAliasFor(d.StableKey);
-                    _aliasMap.TryGetValue(d.StableKey, out var mi);
-                    return new AliasViewRow
-                    {
-                        StableKey = d.StableKey,
-                        ShortKey = d.StableKey.Length <= 28 ? d.StableKey : "…" + d.StableKey[^28..],
-                        Alias = alias,
-                        RegistryKey = mi?.LastRegistryKey ?? string.Empty,
-                        IsPreferredPrimary = mi?.IsPreferredPrimary ?? false,
-                        IsFallbackPrimary = mi?.IsFallbackPrimary ?? false,
-                        DeviceName = d.DeviceName,
-                        MonitorName = d.Name,
-                        MonitorId = d.MonitorId,
-                        InstanceId = d.InstanceId,
-                        SerialNumber = d.SerialNumber,
-                        KnownTargets = mi == null ? string.Empty : string.Join(", ", mi.KnownTargets)
-                    };
-                })
-                .ToList();
+            => AliasSettingsMapper.BuildRows(BuildPresentationList(), _aliasMap);
 
-        private void ApplySettingsDialogResults(AliasSettingsForm dlg)
+        private async Task ApplySettingsDialogResultsAsync(AliasSettingsForm dlg)
         {
-            foreach (var removedKey in dlg.RemovedKeys)
-                _aliasMap.Remove(removedKey);
-
-            foreach (var kvp in dlg.UpdatedMappings)
-            {
-                if (!_aliasMap.TryGetValue(kvp.Key, out var info))
-                    info = new MonitorInfo();
-                info.Name = kvp.Value ?? info.Name;
-                _aliasMap[kvp.Key] = info;
-            }
-
-            foreach (var kv in _aliasMap.Keys.ToList())
-            {
-                var info = _aliasMap[kv];
-                info.IsPreferredPrimary = string.Equals(kv, dlg.PreferredPrimaryKey, StringComparison.OrdinalIgnoreCase);
-                info.IsFallbackPrimary = string.Equals(kv, dlg.FallbackPrimaryKey, StringComparison.OrdinalIgnoreCase);
-                _aliasMap[kv] = info;
-            }
-
+            AliasSettingsMapper.ApplyMonitorSettings(
+                _aliasMap,
+                dlg.RemovedKeys,
+                dlg.UpdatedMappings,
+                dlg.PreferredPrimaryKey,
+                dlg.FallbackPrimaryKey);
             _aliasStore.Save(_aliasMap);
 
             if (dlg.DarkModeResult.HasValue && dlg.DarkModeResult.Value != _uiSettings.DarkMode)
@@ -966,6 +923,11 @@ namespace WorkMonitorSwitcher
             _uiStore.Save(_uiSettings);
 
             RefreshMonitorsAndUi();
+            if (EnforcePreferredPrimaryIfActive("preferred primary after settings save"))
+            {
+                await Task.Delay(400);
+                RefreshMonitorsAndUi();
+            }
         }
 
         // ---------- Working change ----------
@@ -1683,31 +1645,14 @@ namespace WorkMonitorSwitcher
             if (!allowAutomaticFallback)
                 return;
 
-            var firstActive = _detected.Where(d => d.IsPresent && d.IsActive)
-                                       .OrderBy(d => d.PositionX)
-                                       .FirstOrDefault();
-            if (firstActive != null)
-            {
-                var target = MonitorTargetResolver.ResolveTargetArg(firstActive.StableKey, _detected, _aliasMap);
-                if (!string.IsNullOrWhiteSpace(target))
-                    SetPrimaryWithTopologyFallback(target, "left-most active primary");
-            }
+            var target = PrimaryMonitorPreference.ResolveLeftMostActiveTarget(_detected, _aliasMap);
+            if (!string.IsNullOrWhiteSpace(target))
+                SetPrimaryWithTopologyFallback(target, "left-most active primary");
         }
 
         private bool EnforcePreferredPrimaryIfActive(string reason)
         {
-            var primary = _aliasMap.FirstOrDefault(kv => kv.Value.IsPreferredPrimary);
-            if (string.IsNullOrWhiteSpace(primary.Key))
-                return false;
-
-            var activePrimary = _detected.FirstOrDefault(d =>
-                d.IsPresent &&
-                d.IsActive &&
-                d.StableKey.Equals(primary.Key, StringComparison.OrdinalIgnoreCase));
-            if (activePrimary == null)
-                return false;
-
-            var target = MonitorTargetResolver.ResolveTargetArg(primary.Key, _detected, _aliasMap);
+            var target = PrimaryMonitorPreference.ResolvePreferredPrimaryTarget(_detected, _aliasMap);
             if (string.IsNullOrWhiteSpace(target))
                 return false;
 

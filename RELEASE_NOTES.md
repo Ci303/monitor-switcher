@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.3.5 - 2026-06-26
+
+### Improved
+
+- Extracted alias settings mapping and primary monitor preference resolution out of the main form to reduce future monitor-action risk.
+- Settings now applies the selected preferred primary monitor immediately on Save when that monitor is active.
+- Settings now prevents the same monitor being selected as both primary and fallback primary.
+- Settings now greys out disabled fallback primary checkboxes when the same monitor is selected as primary.
+- Renamed the Settings confirmation button from OK to Save.
+
 ## v0.3.4 - 2026-06-26
 
 ### Added

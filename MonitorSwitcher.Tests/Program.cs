@@ -14,6 +14,9 @@ var tests = new (string Name, Action Body)[]
     ("MonitorPresentationBuilder handles duplicate stable keys without throwing", PresentationBuilderHandlesDuplicateStableKeys),
     ("MonitorPresentationBuilder preserves disconnected detected state", PresentationBuilderPreservesDisconnectedState),
     ("DisplayTopologyService compacts remaining displays around the fallback primary", DisplayTopologyCompactsAroundFallbackPrimary),
+    ("AliasSettingsMapper applies aliases and primary selections", AliasSettingsMapperAppliesAliasesAndSelections),
+    ("AliasSettingsMapper clears fallback when it matches preferred primary", AliasSettingsMapperClearsFallbackWhenItMatchesPreferredPrimary),
+    ("PrimaryMonitorPreference resolves configured primary targets", PrimaryMonitorPreferenceResolvesConfiguredTargets),
 };
 
 var failures = new List<string>();
@@ -216,6 +219,102 @@ static void DisplayTopologyCompactsAroundFallbackPrimary()
 
     AssertEquals(new DisplayPosition(0, 0), positions[1], "Expected fallback primary to move to origin.");
     AssertEquals(new DisplayPosition(2560, -1106), positions[3], "Expected right display to remain to the right with its vertical offset preserved.");
+}
+
+static void AliasSettingsMapperAppliesAliasesAndSelections()
+{
+    var aliases = new Dictionary<string, MonitorInfo>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SN:LEFT"] = new MonitorInfo { Name = "Old Left", IsPreferredPrimary = true },
+        ["SN:RIGHT"] = new MonitorInfo { Name = "Old Right" },
+        ["SN:STALE"] = new MonitorInfo { Name = "Stale" }
+    };
+
+    var updated = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SN:LEFT"] = "Left Monitor",
+        ["SN:RIGHT"] = "Right Monitor"
+    };
+
+    AliasSettingsMapper.ApplyMonitorSettings(
+        aliases,
+        new[] { "SN:STALE" },
+        updated,
+        preferredPrimaryKey: "SN:RIGHT",
+        fallbackPrimaryKey: "SN:LEFT");
+
+    AssertFalse(aliases.ContainsKey("SN:STALE"), "Expected removed monitor key to be deleted.");
+    AssertEquals("Left Monitor", aliases["SN:LEFT"].Name, "Expected alias to be updated.");
+    AssertFalse(aliases["SN:LEFT"].IsPreferredPrimary, "Expected previous preferred primary to be cleared.");
+    AssertTrue(aliases["SN:RIGHT"].IsPreferredPrimary, "Expected selected preferred primary to be set.");
+    AssertTrue(aliases["SN:LEFT"].IsFallbackPrimary, "Expected selected fallback primary to be set.");
+    AssertFalse(aliases["SN:RIGHT"].IsFallbackPrimary, "Expected fallback primary to remain single-select.");
+
+    var rows = AliasSettingsMapper.BuildRows(
+        new[] { Monitor("SN:LEFT", "\\\\.\\DISPLAY1", "AOC", isActive: true) },
+        aliases);
+
+    AssertEquals("Left Monitor", rows[0].Alias, "Expected settings row to use saved alias.");
+    AssertTrue(rows[0].IsFallbackPrimary, "Expected settings row to expose fallback selection.");
+}
+
+static void AliasSettingsMapperClearsFallbackWhenItMatchesPreferredPrimary()
+{
+    var aliases = new Dictionary<string, MonitorInfo>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SN:LEFT"] = new MonitorInfo { Name = "Left Monitor" }
+    };
+
+    AliasSettingsMapper.ApplyMonitorSettings(
+        aliases,
+        Array.Empty<string>(),
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+        preferredPrimaryKey: "SN:LEFT",
+        fallbackPrimaryKey: "SN:LEFT");
+
+    AssertTrue(aliases["SN:LEFT"].IsPreferredPrimary, "Expected preferred primary to be set.");
+    AssertFalse(aliases["SN:LEFT"].IsFallbackPrimary, "Expected same-key fallback primary to be cleared.");
+}
+
+static void PrimaryMonitorPreferenceResolvesConfiguredTargets()
+{
+    var aliases = new Dictionary<string, MonitorInfo>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SN:LEFT"] = new MonitorInfo { IsFallbackPrimary = true },
+        ["SN:RIGHT"] = new MonitorInfo { IsPreferredPrimary = true }
+    };
+
+    var detected = new List<DetectedMonitor>
+    {
+        new DetectedMonitor
+        {
+            StableKey = "SN:LEFT",
+            DeviceName = "\\\\.\\DISPLAY1",
+            Name = "Left",
+            IsPresent = true,
+            IsActive = true,
+            PositionX = -2560
+        },
+        new DetectedMonitor
+        {
+            StableKey = "SN:RIGHT",
+            DeviceName = "\\\\.\\DISPLAY3",
+            Name = "Right",
+            IsPresent = true,
+            IsActive = true,
+            PositionX = 2560
+        }
+    };
+
+    var preferred = PrimaryMonitorPreference.ResolvePreferredPrimaryTarget(detected, aliases);
+    var fallback = PrimaryMonitorPreference.ResolveConfiguredFallbackDeviceName("\\\\.\\DISPLAY3", detected, aliases);
+    var excludedFallback = PrimaryMonitorPreference.ResolveConfiguredFallbackDeviceName("\\\\.\\DISPLAY1", detected, aliases);
+    var automatic = PrimaryMonitorPreference.ResolveLeftMostActiveTarget(detected, aliases);
+
+    AssertEquals("\\\\.\\DISPLAY3", preferred, "Expected active preferred primary target to resolve.");
+    AssertEquals("\\\\.\\DISPLAY1", fallback, "Expected configured fallback device to resolve.");
+    AssertEquals<string?>(null, excludedFallback, "Expected excluded fallback device to be ignored.");
+    AssertEquals("\\\\.\\DISPLAY1", automatic, "Expected left-most active monitor to be automatic fallback.");
 }
 
 static DetectedMonitor Monitor(
