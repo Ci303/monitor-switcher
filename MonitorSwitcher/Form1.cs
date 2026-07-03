@@ -168,9 +168,9 @@ namespace WorkMonitorSwitcher
             _toolTip.SetToolTip(_btnSettings, "Edit aliases, primary monitor, theme, and app tools.");
 
             _btnRefresh = new Button { Text = "Refresh", Size = new Size(88, 32) };
-            _btnRefresh.Click += (_, __) => RefreshMonitorsAndUi();
+            _btnRefresh.Click += (_, __) => ManualRefreshMonitorsAndUi();
             Controls.Add(_btnRefresh);
-            _toolTip.SetToolTip(_btnRefresh, "Detect monitors again.");
+            _toolTip.SetToolTip(_btnRefresh, "Reload aliases and detect monitors again.");
 
             _btnSaveLayout = new Button { Text = "Save", Size = new Size(74, 32) };
             _btnSaveLayout.Click += (_, __) => SaveSelectedLayoutProfile();
@@ -513,7 +513,7 @@ namespace WorkMonitorSwitcher
         {
             _trayMenu = new ContextMenuStrip();
             _trayMenu.Items.Add("Open Monitor Switcher", null, (_, __) => RestoreFromTray());
-            _trayMenu.Items.Add("Refresh", null, (_, __) => RefreshMonitorsAndUi());
+            _trayMenu.Items.Add("Refresh", null, (_, __) => ManualRefreshMonitorsAndUi());
             _trayMenu.Items.Add("Save Layout", null, (_, __) =>
             {
                 ShowMainWindowForInteraction();
@@ -693,6 +693,7 @@ namespace WorkMonitorSwitcher
                     return;
                 }
 
+                SaveLayoutIdentitySnapshot(profile, path, "Saved");
                 _profileStore.AddProfileName(profile);
                 _uiSettings.SelectedLayoutProfile = profile;
                 _uiStore.Save(_uiSettings);
@@ -727,6 +728,25 @@ namespace WorkMonitorSwitcher
             _log.Write(ok
                 ? $"Automatically saved layout profile '{profile}' before disable to {path}."
                 : $"Failed to automatically save layout profile '{profile}' before disable. MultiMonitorTool present: {File.Exists(_toolPath)}.");
+
+            if (ok)
+                SaveLayoutIdentitySnapshot(profile, path, "Automatically saved");
+        }
+
+        private void SaveLayoutIdentitySnapshot(string profile, string layoutPath, string action)
+        {
+            try
+            {
+                var detectedNow = _detectSvc.Detect();
+                var ok = LayoutIdentityStore.Save(layoutPath, detectedNow);
+                _log.Write(ok
+                    ? $"{action} identity map for layout profile '{profile}' to {LayoutIdentityStore.GetIdentityPath(layoutPath)}."
+                    : $"Skipped identity map for layout profile '{profile}' because no active monitor identities were detected.");
+            }
+            catch (Exception ex)
+            {
+                _log.Write($"Failed to save identity map for layout profile '{profile}': {ex.Message}");
+            }
         }
 
         private bool TryCreateAutoSaveBackup(
@@ -825,22 +845,40 @@ namespace WorkMonitorSwitcher
             {
                 var profile = SelectedLayoutProfileName();
                 var path = _profileStore.GetLayoutPath(profile);
-                var ok = _layoutSvc.LoadLayout(path);
-                _log.Write(ok
-                    ? $"Restored layout profile '{profile}' from {path}."
-                    : $"Failed to restore layout profile '{profile}' from {path}.");
 
-                if (!ok)
+                if (!File.Exists(path))
                 {
                     if (showMessage)
                         ThemedMessageBox.Warn(this,
-                            $"Unable to restore layout profile '{profile}'. Save it first and confirm MultiMonitorTool.exe is present.",
+                            $"Unable to restore layout profile '{profile}'. Save it first.",
                             "Restore Layout", _uiSettings.DarkMode);
                     return;
                 }
 
-                await Task.Delay(800);
-                await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
+                var result = await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
+                if (!result.Success)
+                {
+                    var ok = _layoutSvc.LoadLayout(path);
+                    _log.Write(ok
+                        ? $"Fallback MultiMonitorTool restore issued for layout profile '{profile}' from {path}."
+                        : $"Fallback MultiMonitorTool restore failed for layout profile '{profile}' from {path}.");
+
+                    if (ok)
+                    {
+                        await Task.Delay(800);
+                        result = await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
+                    }
+                }
+
+                if (!result.Success)
+                {
+                    if (showMessage)
+                        ThemedMessageBox.Warn(this,
+                            $"Unable to restore layout profile '{profile}'. See diagnostics.log for details.",
+                            "Restore Layout", _uiSettings.DarkMode);
+                    return;
+                }
+
                 RefreshMonitorsAndUi();
                 if (EnforcePreferredPrimaryIfActive("preferred primary after layout restore"))
                 {
@@ -860,11 +898,14 @@ namespace WorkMonitorSwitcher
         private async Task<DisplayTopologyResult> ApplySavedLayoutTopologyWithRetryAsync(string profile, string path)
         {
             DisplayTopologyResult? result = null;
+            var savedIdentities = LayoutIdentityStore.Load(path);
+            if (savedIdentities.Count > 0)
+                _log.Write($"Loaded {savedIdentities.Count} saved monitor identity record(s) for layout profile '{profile}'.");
 
             for (int attempt = 0; attempt < 5; attempt++)
             {
                 var detectedNow = _detectSvc.Detect();
-                result = _topologySvc.ApplyLayoutPositionsFromConfig(path, detectedNow);
+                result = _topologySvc.ApplyLayoutPositionsFromConfig(path, detectedNow, savedIdentities);
                 if (result.Success)
                     break;
 
@@ -1112,6 +1153,23 @@ namespace WorkMonitorSwitcher
         }
 
         // ---------- Refresh + dynamic UI build ----------
+
+        private void ManualRefreshMonitorsAndUi()
+        {
+            ReloadAliasesFromStore("manual refresh");
+            _log.Write("Manual refresh requested.");
+            RefreshMonitorsAndUi();
+        }
+
+        private void ReloadAliasesFromStore(string reason)
+        {
+            var aliases = _aliasStore.Load();
+            _aliasMap.Clear();
+            foreach (var kv in aliases)
+                _aliasMap[kv.Key] = kv.Value;
+
+            _log.Write($"Reloaded {_aliasMap.Count} alias record(s) from {_aliasStore.AliasPath} for {reason}.");
+        }
 
         private void RefreshMonitorsAndUi()
         {

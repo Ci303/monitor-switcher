@@ -18,6 +18,7 @@ var tests = new (string Name, Action Body)[]
     ("DisplayTopologyService compacts remaining displays around the fallback primary", DisplayTopologyCompactsAroundFallbackPrimary),
     ("DisplayTopologyService maps saved orientation to CCD rotation", DisplayTopologyMapsSavedOrientationToCcdRotation),
     ("DisplayTopologyService matches saved layout by monitor identity after DISPLAY number changes", DisplayTopologyMatchesSavedLayoutByIdentity),
+    ("DisplayTopologyService uses saved sidecar identity before DISPLAY number fallback", DisplayTopologyUsesSavedSidecarIdentityBeforeDisplayNumberFallback),
     ("AliasSettingsMapper applies aliases and primary selections", AliasSettingsMapperAppliesAliasesAndSelections),
     ("AliasSettingsMapper clears fallback when it matches preferred primary", AliasSettingsMapperClearsFallbackWhenItMatchesPreferredPrimary),
     ("PrimaryMonitorPreference resolves configured primary targets", PrimaryMonitorPreferenceResolvesConfiguredTargets),
@@ -304,6 +305,80 @@ static void DisplayTopologyMatchesSavedLayoutByIdentity()
         AssertEquals(@"\\.\DISPLAY2", map[@"\\.\DISPLAY1"], "Expected current middle display to use the saved middle layout.");
         AssertEquals(@"\\.\DISPLAY3", map[@"\\.\DISPLAY2"], "Expected current right display to use the saved right layout.");
         AssertEquals(@"\\.\DISPLAY1", map[@"\\.\DISPLAY3"], "Expected current left display to use the saved left layout.");
+    }
+    finally
+    {
+        if (Directory.Exists(dir))
+            Directory.Delete(dir, recursive: true);
+    }
+}
+
+static void DisplayTopologyUsesSavedSidecarIdentityBeforeDisplayNumberFallback()
+{
+    var dir = Path.Combine(Path.GetTempPath(), "MonitorSwitcher.Tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+
+    try
+    {
+        var path = Path.Combine(dir, "monitor-layout.cfg");
+        File.WriteAllText(path, string.Join(Environment.NewLine, new[]
+        {
+            "[Monitor0]",
+            @"Name=\\.\DISPLAY1",
+            @"MonitorID=MONITOR\AOC2703",
+            "SerialNumber=",
+            "Width=2560",
+            "Height=1440",
+            "DisplayOrientation=0",
+            "PositionX=0",
+            "PositionY=0",
+            "[Monitor1]",
+            @"Name=\\.\DISPLAY2",
+            @"MonitorID=MONITOR\AOC2703",
+            "SerialNumber=",
+            "Width=1440",
+            "Height=2560",
+            "DisplayOrientation=3",
+            "PositionX=2560",
+            "PositionY=-1087"
+        }));
+
+        var savedIdentities = new[]
+        {
+            new SavedLayoutIdentity
+            {
+                LayoutDeviceName = @"\\.\DISPLAY1",
+                StableKey = "SN:LEFT",
+                SerialNumber = "LEFT",
+                MonitorId = @"MONITOR\AOC2703"
+            },
+            new SavedLayoutIdentity
+            {
+                LayoutDeviceName = @"\\.\DISPLAY2",
+                StableKey = "SN:RIGHT",
+                SerialNumber = "RIGHT",
+                MonitorId = @"MONITOR\AOC2703"
+            }
+        };
+
+        var detected = new[]
+        {
+            Monitor("SN:RIGHT", @"\\.\DISPLAY1", "AOC Q27B3MA", isActive: true),
+            Monitor("SN:LEFT", @"\\.\DISPLAY2", "AOC Q27B3MA", isActive: true)
+        };
+        detected[0].SerialNumber = "RIGHT";
+        detected[0].MonitorId = @"MONITOR\AOC2703";
+        detected[1].SerialNumber = "LEFT";
+        detected[1].MonitorId = @"MONITOR\AOC2703";
+
+        var map = DisplayTopologyService.ResolveSavedLayoutDeviceNameMap(
+            path,
+            detected,
+            new[] { @"\\.\DISPLAY1", @"\\.\DISPLAY2" },
+            savedIdentities);
+
+        AssertEquals(@"\\.\DISPLAY2", map[@"\\.\DISPLAY1"], "Expected current right display to use the saved right layout.");
+        AssertEquals(@"\\.\DISPLAY1", map[@"\\.\DISPLAY2"], "Expected current left display to use the saved left layout.");
     }
     finally
     {

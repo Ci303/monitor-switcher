@@ -127,7 +127,8 @@ namespace WorkMonitorSwitcher.Services
 
         public DisplayTopologyResult ApplyLayoutPositionsFromConfig(
             string layoutPath,
-            IReadOnlyCollection<DetectedMonitor>? detectedMonitors = null)
+            IReadOnlyCollection<DetectedMonitor>? detectedMonitors = null,
+            IReadOnlyCollection<SavedLayoutIdentity>? savedIdentities = null)
         {
             if (string.IsNullOrWhiteSpace(layoutPath) || !File.Exists(layoutPath))
                 return Failure("Saved layout file was not found.");
@@ -142,7 +143,8 @@ namespace WorkMonitorSwitcher.Services
                 var resolvedLayouts = ResolveSavedLayoutsForCurrentDevices(
                     savedLayouts,
                     detectedMonitors,
-                    snapshot.Entries.Select(e => e.Name));
+                    snapshot.Entries.Select(e => e.Name),
+                    savedIdentities);
 
                 var missing = snapshot.Entries
                     .Where(e => !resolvedLayouts.ContainsKey(e.Name))
@@ -398,21 +400,24 @@ namespace WorkMonitorSwitcher.Services
         internal static IReadOnlyDictionary<string, string> ResolveSavedLayoutDeviceNameMap(
             string layoutPath,
             IReadOnlyCollection<DetectedMonitor> detectedMonitors,
-            IEnumerable<string> currentDeviceNames)
+            IEnumerable<string> currentDeviceNames,
+            IReadOnlyCollection<SavedLayoutIdentity>? savedIdentities = null)
         {
             var savedLayouts = ReadSavedLayoutSettings(layoutPath);
-            return ResolveSavedLayoutsForCurrentDevices(savedLayouts, detectedMonitors, currentDeviceNames)
+            return ResolveSavedLayoutsForCurrentDevices(savedLayouts, detectedMonitors, currentDeviceNames, savedIdentities)
                 .ToDictionary(kv => kv.Key, kv => kv.Value.DeviceName, StringComparer.OrdinalIgnoreCase);
         }
 
         private static Dictionary<string, SavedDisplayLayout> ResolveSavedLayoutsForCurrentDevices(
             IReadOnlyDictionary<string, SavedDisplayLayout> savedLayouts,
             IReadOnlyCollection<DetectedMonitor>? detectedMonitors,
-            IEnumerable<string> currentDeviceNames)
+            IEnumerable<string> currentDeviceNames,
+            IReadOnlyCollection<SavedLayoutIdentity>? savedIdentities = null)
         {
             var resolved = new Dictionary<string, SavedDisplayLayout>(StringComparer.OrdinalIgnoreCase);
             var usedSavedDeviceNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var detectedByDevice = BuildDetectedByDeviceName(detectedMonitors);
+            var strongIdentitySidecar = HasStrongIdentitySidecar(savedIdentities, savedLayouts);
 
             foreach (var currentDeviceName in currentDeviceNames
                          .Where(n => !string.IsNullOrWhiteSpace(n))
@@ -424,6 +429,12 @@ namespace WorkMonitorSwitcher.Services
                 if (detectedByDevice.TryGetValue(currentDeviceKey, out var detected))
                 {
                     layout = FindUniqueUnusedSavedLayout(
+                        savedLayouts,
+                        savedIdentities,
+                        usedSavedDeviceNames,
+                        detected);
+
+                    layout ??= FindUniqueUnusedSavedLayout(
                         savedLayouts.Values,
                         usedSavedDeviceNames,
                         saved => IdentityValueEquals(saved.SerialNumber, detected.SerialNumber));
@@ -435,6 +446,7 @@ namespace WorkMonitorSwitcher.Services
                 }
 
                 if (layout == null &&
+                    !strongIdentitySidecar &&
                     savedLayouts.TryGetValue(currentDeviceName, out var savedByDeviceName) &&
                     !usedSavedDeviceNames.Contains(savedByDeviceName.DeviceName))
                 {
@@ -476,6 +488,105 @@ namespace WorkMonitorSwitcher.Services
         }
 
         private static SavedDisplayLayout? FindUniqueUnusedSavedLayout(
+            IReadOnlyDictionary<string, SavedDisplayLayout> savedLayouts,
+            IReadOnlyCollection<SavedLayoutIdentity>? savedIdentities,
+            ISet<string> usedSavedDeviceNames,
+            DetectedMonitor detected)
+        {
+            if (savedIdentities == null || savedIdentities.Count == 0)
+                return null;
+
+            var identity = FindUniqueUnusedSavedIdentity(
+                savedLayouts,
+                savedIdentities,
+                usedSavedDeviceNames,
+                saved => IdentityValueEquals(saved.StableKey, detected.StableKey));
+
+            identity ??= FindUniqueUnusedSavedIdentity(
+                savedLayouts,
+                savedIdentities,
+                usedSavedDeviceNames,
+                saved => IdentityValueEquals(saved.SerialNumber, detected.SerialNumber));
+
+            identity ??= FindUniqueUnusedSavedIdentity(
+                savedLayouts,
+                savedIdentities,
+                usedSavedDeviceNames,
+                saved => IdentityValueEquals(saved.InstanceId, detected.InstanceId));
+
+            identity ??= FindUniqueUnusedSavedIdentity(
+                savedLayouts,
+                savedIdentities,
+                usedSavedDeviceNames,
+                saved => IdentityValueEquals(saved.MonitorKey, detected.MonitorKey));
+
+            identity ??= FindUniqueUnusedSavedIdentity(
+                savedLayouts,
+                savedIdentities,
+                usedSavedDeviceNames,
+                saved => IdentityValueEquals(saved.MonitorId, detected.MonitorId));
+
+            if (identity == null)
+                return null;
+
+            var layoutDeviceName = GetIdentityLayoutDeviceName(identity);
+            return savedLayouts.TryGetValue(layoutDeviceName, out var layout)
+                ? layout
+                : null;
+        }
+
+        private static SavedLayoutIdentity? FindUniqueUnusedSavedIdentity(
+            IReadOnlyDictionary<string, SavedDisplayLayout> savedLayouts,
+            IEnumerable<SavedLayoutIdentity> savedIdentities,
+            ISet<string> usedSavedDeviceNames,
+            Func<SavedLayoutIdentity, bool> predicate)
+        {
+            var matches = savedIdentities
+                .Where(saved =>
+                {
+                    var layoutDeviceName = GetIdentityLayoutDeviceName(saved);
+                    return !string.IsNullOrWhiteSpace(layoutDeviceName) &&
+                           savedLayouts.ContainsKey(layoutDeviceName) &&
+                           !usedSavedDeviceNames.Contains(layoutDeviceName) &&
+                           predicate(saved);
+                })
+                .GroupBy(GetIdentityLayoutDeviceName, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
+
+            return matches.Count == 1 ? matches[0] : null;
+        }
+
+        private static bool HasStrongIdentitySidecar(
+            IReadOnlyCollection<SavedLayoutIdentity>? savedIdentities,
+            IReadOnlyDictionary<string, SavedDisplayLayout> savedLayouts)
+        {
+            return savedIdentities != null &&
+                   savedIdentities.Any(saved =>
+                       savedLayouts.ContainsKey(GetIdentityLayoutDeviceName(saved)) &&
+                       HasStrongIdentity(saved));
+        }
+
+        private static bool HasStrongIdentity(SavedLayoutIdentity identity)
+        {
+            if (NormalizeIdentityValue(identity.SerialNumber).Length > 0)
+                return true;
+            if (NormalizeIdentityValue(identity.InstanceId).Length > 0)
+                return true;
+            if (NormalizeIdentityValue(identity.MonitorKey).Length > 0)
+                return true;
+            if (NormalizeIdentityValue(identity.MonitorId).Length > 0)
+                return true;
+
+            var stableKey = NormalizeIdentityValue(identity.StableKey);
+            return stableKey.Length > 0 &&
+                   !stableKey.StartsWith("DEV:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetIdentityLayoutDeviceName(SavedLayoutIdentity identity)
+            => FirstNonBlank(identity.LayoutDeviceName, identity.DeviceName);
+
+        private static SavedDisplayLayout? FindUniqueUnusedSavedLayout(
             IEnumerable<SavedDisplayLayout> savedLayouts,
             ISet<string> usedSavedDeviceNames,
             Func<SavedDisplayLayout, bool> predicate)
@@ -487,6 +598,9 @@ namespace WorkMonitorSwitcher.Services
 
             return matches.Count == 1 ? matches[0] : null;
         }
+
+        private static string FirstNonBlank(params string?[] values)
+            => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v))?.Trim() ?? string.Empty;
 
         private static bool IdentityValueEquals(string? left, string? right)
         {
