@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using WorkMonitorSwitcher.Model;
 
 namespace WorkMonitorSwitcher.Services
 {
@@ -124,7 +125,9 @@ namespace WorkMonitorSwitcher.Services
             }
         }
 
-        public DisplayTopologyResult ApplyLayoutPositionsFromConfig(string layoutPath)
+        public DisplayTopologyResult ApplyLayoutPositionsFromConfig(
+            string layoutPath,
+            IReadOnlyCollection<DetectedMonitor>? detectedMonitors = null)
         {
             if (string.IsNullOrWhiteSpace(layoutPath) || !File.Exists(layoutPath))
                 return Failure("Saved layout file was not found.");
@@ -136,8 +139,13 @@ namespace WorkMonitorSwitcher.Services
                     return Failure("Saved layout file does not contain monitor positions.");
 
                 var snapshot = QueryActiveTopology();
+                var resolvedLayouts = ResolveSavedLayoutsForCurrentDevices(
+                    savedLayouts,
+                    detectedMonitors,
+                    snapshot.Entries.Select(e => e.Name));
+
                 var missing = snapshot.Entries
-                    .Where(e => !savedLayouts.ContainsKey(e.Name))
+                    .Where(e => !resolvedLayouts.ContainsKey(e.Name))
                     .Select(e => e.Name)
                     .ToList();
                 if (missing.Count > 0)
@@ -145,27 +153,30 @@ namespace WorkMonitorSwitcher.Services
 
                 var positions = snapshot.Entries.ToDictionary(
                     e => e.SourceModeIndex,
-                    e => savedLayouts[e.Name].Position);
+                    e => resolvedLayouts[e.Name].Position);
                 var sizes = snapshot.Entries
-                    .Where(e => savedLayouts[e.Name].Size.HasValue)
+                    .Where(e => resolvedLayouts[e.Name].Size.HasValue)
                     .ToDictionary(
                         e => e.SourceModeIndex,
-                        e => savedLayouts[e.Name].Size!.Value);
+                        e => resolvedLayouts[e.Name].Size!.Value);
                 var rotations = snapshot.Entries
-                    .Where(e => savedLayouts[e.Name].Rotation.HasValue)
+                    .Where(e => resolvedLayouts[e.Name].Rotation.HasValue)
                     .ToDictionary(
                         e => e.SourceModeIndex,
-                        e => savedLayouts[e.Name].Rotation!.Value);
+                        e => resolvedLayouts[e.Name].Rotation!.Value);
+                var layoutSourceDevices = snapshot.Entries.ToDictionary(
+                    e => e.SourceModeIndex,
+                    e => resolvedLayouts[e.Name].DeviceName);
 
                 var primary = snapshot.Entries.FirstOrDefault(e =>
                 {
-                    var p = savedLayouts[e.Name].Position;
+                    var p = resolvedLayouts[e.Name].Position;
                     return p.X == 0 && p.Y == 0;
-                }) ?? snapshot.Entries.OrderBy(e => savedLayouts[e.Name].Position.X).First();
+                }) ?? snapshot.Entries.OrderBy(e => resolvedLayouts[e.Name].Position.X).First();
 
                 var orderedEntries = snapshot.Entries
                     .OrderBy(e => ReferenceEquals(e, primary) ? 0 : 1)
-                    .ThenBy(e => savedLayouts[e.Name].Position.X)
+                    .ThenBy(e => resolvedLayouts[e.Name].Position.X)
                     .ToList();
 
                 return ValidateAndApply(
@@ -174,7 +185,8 @@ namespace WorkMonitorSwitcher.Services
                     positions,
                     $"Applied saved layout positions from '{layoutPath}'.",
                     sizes,
-                    rotations);
+                    rotations,
+                    layoutSourceDevices);
             }
             catch (Exception ex)
             {
@@ -220,7 +232,8 @@ namespace WorkMonitorSwitcher.Services
             IReadOnlyDictionary<int, DisplayPosition> positions,
             string successMessage,
             IReadOnlyDictionary<int, DisplaySize>? sizes = null,
-            IReadOnlyDictionary<int, uint>? rotations = null)
+            IReadOnlyDictionary<int, uint>? rotations = null,
+            IReadOnlyDictionary<int, string>? layoutSourceDevices = null)
         {
             foreach (var kv in positions)
             {
@@ -254,6 +267,12 @@ namespace WorkMonitorSwitcher.Services
                 {
                     var p = positions[e.SourceModeIndex];
                     var parts = new List<string> { $"{e.Name}: {e.X},{e.Y} -> {p.X},{p.Y}" };
+                    if (layoutSourceDevices != null &&
+                        layoutSourceDevices.TryGetValue(e.SourceModeIndex, out var savedDeviceName) &&
+                        !DeviceNameEquals(e.Name, savedDeviceName))
+                    {
+                        parts.Add($"saved as {savedDeviceName}");
+                    }
                     if (sizes != null && sizes.TryGetValue(e.SourceModeIndex, out var size))
                         parts.Add($"size {e.Width}x{e.Height} -> {size.Width}x{size.Height}");
                     if (rotations != null && rotations.TryGetValue(e.SourceModeIndex, out var rotation))
@@ -376,6 +395,117 @@ namespace WorkMonitorSwitcher.Services
             return -1;
         }
 
+        internal static IReadOnlyDictionary<string, string> ResolveSavedLayoutDeviceNameMap(
+            string layoutPath,
+            IReadOnlyCollection<DetectedMonitor> detectedMonitors,
+            IEnumerable<string> currentDeviceNames)
+        {
+            var savedLayouts = ReadSavedLayoutSettings(layoutPath);
+            return ResolveSavedLayoutsForCurrentDevices(savedLayouts, detectedMonitors, currentDeviceNames)
+                .ToDictionary(kv => kv.Key, kv => kv.Value.DeviceName, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static Dictionary<string, SavedDisplayLayout> ResolveSavedLayoutsForCurrentDevices(
+            IReadOnlyDictionary<string, SavedDisplayLayout> savedLayouts,
+            IReadOnlyCollection<DetectedMonitor>? detectedMonitors,
+            IEnumerable<string> currentDeviceNames)
+        {
+            var resolved = new Dictionary<string, SavedDisplayLayout>(StringComparer.OrdinalIgnoreCase);
+            var usedSavedDeviceNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var detectedByDevice = BuildDetectedByDeviceName(detectedMonitors);
+
+            foreach (var currentDeviceName in currentDeviceNames
+                         .Where(n => !string.IsNullOrWhiteSpace(n))
+                         .Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                SavedDisplayLayout? layout = null;
+                var currentDeviceKey = MonitorTargetResolver.NormalizeDeviceNameForComparison(currentDeviceName);
+
+                if (detectedByDevice.TryGetValue(currentDeviceKey, out var detected))
+                {
+                    layout = FindUniqueUnusedSavedLayout(
+                        savedLayouts.Values,
+                        usedSavedDeviceNames,
+                        saved => IdentityValueEquals(saved.SerialNumber, detected.SerialNumber));
+
+                    layout ??= FindUniqueUnusedSavedLayout(
+                        savedLayouts.Values,
+                        usedSavedDeviceNames,
+                        saved => IdentityValueEquals(saved.MonitorId, detected.MonitorId));
+                }
+
+                if (layout == null &&
+                    savedLayouts.TryGetValue(currentDeviceName, out var savedByDeviceName) &&
+                    !usedSavedDeviceNames.Contains(savedByDeviceName.DeviceName))
+                {
+                    layout = savedByDeviceName;
+                }
+
+                if (layout == null)
+                    continue;
+
+                resolved[currentDeviceName] = layout;
+                usedSavedDeviceNames.Add(layout.DeviceName);
+            }
+
+            return resolved;
+        }
+
+        private static Dictionary<string, DetectedMonitor> BuildDetectedByDeviceName(
+            IReadOnlyCollection<DetectedMonitor>? detectedMonitors)
+        {
+            if (detectedMonitors == null || detectedMonitors.Count == 0)
+                return new Dictionary<string, DetectedMonitor>(StringComparer.OrdinalIgnoreCase);
+
+            return detectedMonitors
+                .Where(d => d.IsPresent &&
+                            d.IsActive &&
+                            !string.IsNullOrWhiteSpace(d.DeviceName))
+                .Select(d => new
+                {
+                    DeviceName = MonitorTargetResolver.NormalizeDeviceNameForComparison(d.DeviceName),
+                    Monitor = d
+                })
+                .Where(x => !string.IsNullOrWhiteSpace(x.DeviceName))
+                .GroupBy(x => x.DeviceName, StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() == 1)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.First().Monitor,
+                    StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static SavedDisplayLayout? FindUniqueUnusedSavedLayout(
+            IEnumerable<SavedDisplayLayout> savedLayouts,
+            ISet<string> usedSavedDeviceNames,
+            Func<SavedDisplayLayout, bool> predicate)
+        {
+            var matches = savedLayouts
+                .Where(saved => !usedSavedDeviceNames.Contains(saved.DeviceName))
+                .Where(predicate)
+                .ToList();
+
+            return matches.Count == 1 ? matches[0] : null;
+        }
+
+        private static bool IdentityValueEquals(string? left, string? right)
+        {
+            var leftValue = NormalizeIdentityValue(left);
+            var rightValue = NormalizeIdentityValue(right);
+
+            return leftValue.Length > 0 &&
+                   rightValue.Length > 0 &&
+                   leftValue.Equals(rightValue, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizeIdentityValue(string? value)
+        {
+            var normalized = (value ?? string.Empty).Trim().Replace('/', '\\');
+            while (normalized.Contains("\\\\", StringComparison.Ordinal))
+                normalized = normalized.Replace("\\\\", "\\");
+            return normalized;
+        }
+
         private static string GetSourceDeviceName(DISPLAYCONFIG_PATH_SOURCE_INFO source)
         {
             var request = new DISPLAYCONFIG_SOURCE_DEVICE_NAME
@@ -400,6 +530,8 @@ namespace WorkMonitorSwitcher.Services
         {
             var layouts = new Dictionary<string, SavedDisplayLayout>(StringComparer.OrdinalIgnoreCase);
             string? name = null;
+            string? serialNumber = null;
+            string? monitorId = null;
             int? x = null;
             int? y = null;
             int? width = null;
@@ -414,6 +546,9 @@ namespace WorkMonitorSwitcher.Services
                         ? new DisplaySize(width.Value, height.Value)
                         : (DisplaySize?)null;
                     layouts[name] = new SavedDisplayLayout(
+                        name,
+                        serialNumber ?? string.Empty,
+                        monitorId ?? string.Empty,
                         new DisplayPosition(x.Value, y.Value),
                         size,
                         rotation);
@@ -431,6 +566,8 @@ namespace WorkMonitorSwitcher.Services
                 {
                     Commit();
                     name = null;
+                    serialNumber = null;
+                    monitorId = null;
                     x = null;
                     y = null;
                     width = null;
@@ -448,6 +585,14 @@ namespace WorkMonitorSwitcher.Services
                 if (key.Equals("Name", StringComparison.OrdinalIgnoreCase))
                 {
                     name = value;
+                }
+                else if (key.Equals("SerialNumber", StringComparison.OrdinalIgnoreCase))
+                {
+                    serialNumber = value;
+                }
+                else if (key.Equals("MonitorID", StringComparison.OrdinalIgnoreCase))
+                {
+                    monitorId = value;
                 }
                 else if (key.Equals("PositionX", StringComparison.OrdinalIgnoreCase) &&
                          int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedX))
@@ -529,6 +674,9 @@ namespace WorkMonitorSwitcher.Services
         }
 
         private sealed record SavedDisplayLayout(
+            string DeviceName,
+            string SerialNumber,
+            string MonitorId,
             DisplayPosition Position,
             DisplaySize? Size,
             uint? Rotation);

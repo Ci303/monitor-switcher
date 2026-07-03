@@ -49,6 +49,7 @@ namespace WorkMonitorSwitcher
         private readonly CheckBox _chkTray = new() { Text = "Minimize to tray", AutoSize = true };
         private readonly CheckBox _chkStartup = new() { Text = "Start with Windows", AutoSize = true };
         private readonly CheckBox _chkConfirmDisable = new() { Text = "Confirm before disabling", AutoSize = true };
+        private readonly CheckBox _chkAutoSaveLayout = new() { Text = "Auto-save layout before disabling", AutoSize = true };
         private readonly Button _layoutProfileButton = new() { Text = "Default", AutoSize = false, Size = new Size(150, 26), TextAlign = ContentAlignment.MiddleLeft };
         private readonly Button _deleteProfile = new() { Text = "Delete Profile", AutoSize = false, Size = new Size(96, 26) };
         private readonly TextBox _details = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
@@ -72,6 +73,7 @@ namespace WorkMonitorSwitcher
         public bool? MinimizeToTrayResult { get; private set; }
         public bool? StartWithWindowsResult { get; private set; }
         public bool? ConfirmBeforeDisableResult { get; private set; }
+        public bool? AutoSaveLayoutBeforeDisableResult { get; private set; }
         public string? SelectedLayoutProfileResult { get; private set; }
         public HashSet<string> RemovedLayoutProfiles { get; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -82,6 +84,7 @@ namespace WorkMonitorSwitcher
             bool minimizeToTray,
             bool startWithWindows,
             bool confirmBeforeDisable,
+            bool autoSaveLayoutBeforeDisable,
             string cfgPath,
             List<string> layoutProfiles,
             string selectedLayoutProfile,
@@ -127,6 +130,7 @@ namespace WorkMonitorSwitcher
             _chkTray.Checked = minimizeToTray;
             _chkStartup.Checked = startWithWindows;
             _chkConfirmDisable.Checked = confirmBeforeDisable;
+            _chkAutoSaveLayout.Checked = autoSaveLayoutBeforeDisable;
             SetSelectedLayoutProfile(_selectedLayoutProfile);
             _grid.RowHeadersVisible = false;
             _grid.AllowUserToOrderColumns = true;
@@ -297,6 +301,7 @@ namespace WorkMonitorSwitcher
             _toolTip.SetToolTip(_chkTray, "Close to the notification area instead of exiting.");
             _toolTip.SetToolTip(_chkStartup, "Start Monitor Switcher when you sign in to Windows.");
             _toolTip.SetToolTip(_chkConfirmDisable, "Ask before disabling a monitor.");
+            _toolTip.SetToolTip(_chkAutoSaveLayout, "Overwrite the selected layout profile before disabling a monitor. A backup is kept first.");
             _toolTip.SetToolTip(_layoutProfileButton, "Current layout profile used by the main window.");
             _toolTip.SetToolTip(_deleteProfile, "Delete the selected saved layout profile. Default cannot be deleted.");
             _toolTip.SetToolTip(_remove, "Remove selected saved monitor entries.");
@@ -322,11 +327,13 @@ namespace WorkMonitorSwitcher
             _chkTray.Margin = new Padding(0, 3, 18, 3);
             _chkStartup.Margin = new Padding(0, 3, 18, 3);
             _chkConfirmDisable.Margin = new Padding(0, 3, 18, 3);
+            _chkAutoSaveLayout.Margin = new Padding(0, 3, 18, 3);
             topBar.Controls.Add(_chkDark);
             topBar.Controls.Add(_chkTopMost);
             topBar.Controls.Add(_chkTray);
             topBar.Controls.Add(_chkStartup);
             topBar.Controls.Add(_chkConfirmDisable);
+            topBar.Controls.Add(_chkAutoSaveLayout);
 
             var profileBar = new FlowLayoutPanel
             {
@@ -432,6 +439,7 @@ namespace WorkMonitorSwitcher
                 MinimizeToTrayResult = _chkTray.Checked;
                 StartWithWindowsResult = _chkStartup.Checked;
                 ConfirmBeforeDisableResult = _chkConfirmDisable.Checked;
+                AutoSaveLayoutBeforeDisableResult = _chkAutoSaveLayout.Checked;
                 SelectedLayoutProfileResult = _selectedLayoutProfile;
                 DialogResult = DialogResult.OK;
                 Close();

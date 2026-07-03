@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.3.7 - 2026-07-03
+
+### Added
+
+- Added a Settings option to control whether Monitor Switcher automatically saves the selected layout profile before disabling a display.
+- Added timestamped backups before any automatic layout-profile overwrite.
+
+### Fixed
+
+- Fixed saved-layout restore when Windows reassigns `\\.\DISPLAYn` names by matching saved layouts to physical monitor identity before applying position, resolution, and rotation.
+- Stopped automatic disable actions from overwriting saved layout profiles by default.
+
+### Improved
+
+- Added diagnostics logging when automatic layout-profile saves are skipped, attempted, backed up, or fail.
+- Added regression coverage for display-name reassignment restore and automatic layout-profile backup naming.
+
 ## v0.3.6 - 2026-06-26
 
 ### Improved

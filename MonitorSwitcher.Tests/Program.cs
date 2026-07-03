@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using WorkMonitorSwitcher;
 using WorkMonitorSwitcher.Model;
 using WorkMonitorSwitcher.Services;
 
@@ -16,10 +17,13 @@ var tests = new (string Name, Action Body)[]
     ("MonitorPresentationBuilder preserves disconnected detected state", PresentationBuilderPreservesDisconnectedState),
     ("DisplayTopologyService compacts remaining displays around the fallback primary", DisplayTopologyCompactsAroundFallbackPrimary),
     ("DisplayTopologyService maps saved orientation to CCD rotation", DisplayTopologyMapsSavedOrientationToCcdRotation),
+    ("DisplayTopologyService matches saved layout by monitor identity after DISPLAY number changes", DisplayTopologyMatchesSavedLayoutByIdentity),
     ("AliasSettingsMapper applies aliases and primary selections", AliasSettingsMapperAppliesAliasesAndSelections),
     ("AliasSettingsMapper clears fallback when it matches preferred primary", AliasSettingsMapperClearsFallbackWhenItMatchesPreferredPrimary),
     ("PrimaryMonitorPreference resolves configured primary targets", PrimaryMonitorPreferenceResolvesConfiguredTargets),
     ("AtomicFileWriter replaces existing files and keeps a backup", AtomicFileWriterReplacesExistingFilesAndKeepsBackup),
+    ("UiSettings disables automatic layout saves by default", UiSettingsDisablesAutomaticLayoutSavesByDefault),
+    ("Form1 builds unique automatic layout backup paths", Form1BuildsUniqueAutomaticLayoutBackupPaths),
 };
 
 var failures = new List<string>();
@@ -243,6 +247,71 @@ static void DisplayTopologyMapsSavedOrientationToCcdRotation()
         "Expected unknown orientation to be rejected.");
 }
 
+static void DisplayTopologyMatchesSavedLayoutByIdentity()
+{
+    var dir = Path.Combine(Path.GetTempPath(), "MonitorSwitcher.Tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+
+    try
+    {
+        var path = Path.Combine(dir, "monitor-layout.cfg");
+        File.WriteAllText(path, string.Join(Environment.NewLine, new[]
+        {
+            "[Monitor0]",
+            @"Name=\\.\DISPLAY1",
+            @"MonitorID=MONITOR\AOC2703\{4d36e96e-e325-11ce-bfc1-08002be10318}\0000",
+            "SerialNumber=17ZQ9HA007983",
+            "Width=2560",
+            "Height=1440",
+            "DisplayOrientation=0",
+            "PositionX=-2560",
+            "PositionY=19",
+            "[Monitor1]",
+            @"Name=\\.\DISPLAY2",
+            @"MonitorID=MONITOR\AOC2730\{4d36e96e-e325-11ce-bfc1-08002be10318}\0005",
+            "SerialNumber=",
+            "Width=2560",
+            "Height=1440",
+            "DisplayOrientation=0",
+            "PositionX=0",
+            "PositionY=0",
+            "[Monitor2]",
+            @"Name=\\.\DISPLAY3",
+            @"MonitorID=MONITOR\AOC2703\{4d36e96e-e325-11ce-bfc1-08002be10318}\0004",
+            "SerialNumber=17ZP6HA001814",
+            "Width=1440",
+            "Height=2560",
+            "DisplayOrientation=3",
+            "PositionX=2560",
+            "PositionY=-1087"
+        }));
+
+        var detected = new[]
+        {
+            Monitor("SN:17ZQ9HA007983", @"\\.\DISPLAY3", "Left", isActive: true),
+            Monitor("MK:MIDDLE", @"\\.\DISPLAY1", "Middle", isActive: true),
+            Monitor("SN:17ZP6HA001814", @"\\.\DISPLAY2", "Right", isActive: true)
+        };
+        detected[0].SerialNumber = "17ZQ9HA007983";
+        detected[1].MonitorId = @"MONITOR\AOC2730\{4d36e96e-e325-11ce-bfc1-08002be10318}\0005";
+        detected[2].SerialNumber = "17ZP6HA001814";
+
+        var map = DisplayTopologyService.ResolveSavedLayoutDeviceNameMap(
+            path,
+            detected,
+            new[] { @"\\.\DISPLAY1", @"\\.\DISPLAY2", @"\\.\DISPLAY3" });
+
+        AssertEquals(@"\\.\DISPLAY2", map[@"\\.\DISPLAY1"], "Expected current middle display to use the saved middle layout.");
+        AssertEquals(@"\\.\DISPLAY3", map[@"\\.\DISPLAY2"], "Expected current right display to use the saved right layout.");
+        AssertEquals(@"\\.\DISPLAY1", map[@"\\.\DISPLAY3"], "Expected current left display to use the saved left layout.");
+    }
+    finally
+    {
+        if (Directory.Exists(dir))
+            Directory.Delete(dir, recursive: true);
+    }
+}
+
 static void AliasSettingsMapperAppliesAliasesAndSelections()
 {
     var aliases = new Dictionary<string, MonitorInfo>(StringComparer.OrdinalIgnoreCase)
@@ -354,6 +423,44 @@ static void AtomicFileWriterReplacesExistingFilesAndKeepsBackup()
         AssertEquals("new", File.ReadAllText(path), "Expected target file to contain replacement content.");
         AssertTrue(File.Exists(path + ".bak"), "Expected a backup file to be created for replaced content.");
         AssertEquals("old", File.ReadAllText(path + ".bak"), "Expected backup file to contain previous content.");
+    }
+    finally
+    {
+        if (Directory.Exists(dir))
+            Directory.Delete(dir, recursive: true);
+    }
+}
+
+static void UiSettingsDisablesAutomaticLayoutSavesByDefault()
+{
+    var settings = new UiSettings();
+
+    AssertFalse(settings.AutoSaveLayoutBeforeDisable,
+        "Expected automatic layout saves before disable to be off by default.");
+}
+
+static void Form1BuildsUniqueAutomaticLayoutBackupPaths()
+{
+    var dir = Path.Combine(Path.GetTempPath(), "MonitorSwitcher.Tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+
+    try
+    {
+        var layoutPath = Path.Combine(dir, "monitor-layout.cfg");
+        var timestamp = new DateTime(2026, 7, 2, 21, 16, 22);
+
+        var first = Form1.NextAutoSaveBackupPath(layoutPath, timestamp);
+        AssertEquals(
+            layoutPath + ".autosave-20260702-211622.bak",
+            first,
+            "Expected first automatic backup path to use the timestamp.");
+
+        File.WriteAllText(first, "existing backup");
+        var second = Form1.NextAutoSaveBackupPath(layoutPath, timestamp);
+        AssertEquals(
+            layoutPath + ".autosave-20260702-211622-2.bak",
+            second,
+            "Expected backup path to avoid overwriting an existing backup.");
     }
     finally
     {

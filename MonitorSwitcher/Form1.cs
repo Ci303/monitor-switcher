@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -703,6 +704,75 @@ namespace WorkMonitorSwitcher
             }
         }
 
+        private void AutoSaveSelectedLayoutBeforeDisable()
+        {
+            var profile = SelectedLayoutProfileName();
+            var path = SelectedLayoutPath();
+
+            if (!_uiSettings.AutoSaveLayoutBeforeDisable)
+            {
+                _log.Write($"Skipped automatic layout profile save before disable because auto-save is disabled. Profile '{profile}' at {path} remains unchanged.");
+                return;
+            }
+
+            _log.Write($"Automatic layout profile save before disable requested for '{profile}' at {path}.");
+
+            if (File.Exists(path) && !TryCreateAutoSaveBackup(profile, path, out var backupPath, out var backupError))
+            {
+                _log.Write($"Skipped automatic layout profile save for '{profile}' because backup failed: {backupError}");
+                return;
+            }
+
+            var ok = _layoutSvc.SaveLayout(path);
+            _log.Write(ok
+                ? $"Automatically saved layout profile '{profile}' before disable to {path}."
+                : $"Failed to automatically save layout profile '{profile}' before disable. MultiMonitorTool present: {File.Exists(_toolPath)}.");
+        }
+
+        private bool TryCreateAutoSaveBackup(
+            string profile,
+            string layoutPath,
+            out string backupPath,
+            out string errorMessage)
+        {
+            backupPath = string.Empty;
+            errorMessage = string.Empty;
+
+            try
+            {
+                var directory = Path.GetDirectoryName(layoutPath);
+                if (!string.IsNullOrWhiteSpace(directory))
+                    Directory.CreateDirectory(directory);
+
+                backupPath = NextAutoSaveBackupPath(layoutPath, DateTime.Now);
+                File.Copy(layoutPath, backupPath, overwrite: false);
+                _log.Write($"Backed up layout profile '{profile}' before automatic save to {backupPath}.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                return false;
+            }
+        }
+
+        internal static string NextAutoSaveBackupPath(string layoutPath, DateTime timestamp)
+        {
+            var stamp = timestamp.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+            var basePath = $"{layoutPath}.autosave-{stamp}.bak";
+            if (!File.Exists(basePath))
+                return basePath;
+
+            for (int i = 2; i < 1000; i++)
+            {
+                var candidate = $"{layoutPath}.autosave-{stamp}-{i}.bak";
+                if (!File.Exists(candidate))
+                    return candidate;
+            }
+
+            return $"{layoutPath}.autosave-{stamp}-{Guid.NewGuid():N}.bak";
+        }
+
         private string? PromptForLayoutProfileName(string currentName)
         {
             using var dlg = new Form
@@ -793,7 +863,8 @@ namespace WorkMonitorSwitcher
 
             for (int attempt = 0; attempt < 5; attempt++)
             {
-                result = _topologySvc.ApplyLayoutPositionsFromConfig(path);
+                var detectedNow = _detectSvc.Detect();
+                result = _topologySvc.ApplyLayoutPositionsFromConfig(path, detectedNow);
                 if (result.Success)
                     break;
 
@@ -869,6 +940,7 @@ namespace WorkMonitorSwitcher
                 _uiSettings.MinimizeToTray,
                 _uiSettings.StartWithWindows,
                 _uiSettings.ConfirmBeforeDisable,
+                _uiSettings.AutoSaveLayoutBeforeDisable,
                 Path.Combine(AppContext.BaseDirectory, "MultiMonitorTool.cfg"),
                 _profileStore.LoadProfileNames(),
                 SelectedLayoutProfileName(),
@@ -955,6 +1027,9 @@ namespace WorkMonitorSwitcher
 
                 if (dlg.ConfirmBeforeDisableResult.HasValue)
                     _uiSettings.ConfirmBeforeDisable = dlg.ConfirmBeforeDisableResult.Value;
+
+                if (dlg.AutoSaveLayoutBeforeDisableResult.HasValue)
+                    _uiSettings.AutoSaveLayoutBeforeDisable = dlg.AutoSaveLayoutBeforeDisableResult.Value;
 
                 if (!string.IsNullOrWhiteSpace(dlg.SelectedLayoutProfileResult))
                     _uiSettings.SelectedLayoutProfile = dlg.SelectedLayoutProfileResult;
@@ -1416,7 +1491,7 @@ namespace WorkMonitorSwitcher
                 {
                     // Capture baseline layout before any primary-monitor topology change.
                     bool allActiveNow = _detected.Count > 0 && _detected.All(d => d.IsPresent && d.IsActive);
-                    if (allActiveNow) _layoutSvc.SaveLayout(SelectedLayoutPath());
+                    if (allActiveNow) AutoSaveSelectedLayoutBeforeDisable();
 
                     if (!string.IsNullOrWhiteSpace(disablingDevice))
                     {
