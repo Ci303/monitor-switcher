@@ -1796,17 +1796,28 @@ namespace WorkMonitorSwitcher
             {
                 var profile = SelectedLayoutProfileName();
                 var path = SelectedLayoutPath();
-                if (!_layoutSvc.LoadLayout(path))
+                if (File.Exists(path))
                 {
-                    // Optional: notify if missing
-                    // ThemedMessageBox.Warn(this, "Saved monitor layout file not found.", "Monitor Switcher", _uiSettings.DarkMode);
+                    var result = await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
+                    if (result.Success)
+                    {
+                        _log.Write($"Auto-restored layout profile '{profile}' after all monitors became active.");
+                        restoredLayout = true;
+                    }
+                    else if (_layoutSvc.LoadLayout(path))
+                    {
+                        _log.Write($"Fallback MultiMonitorTool auto-restore issued for layout profile '{profile}'.");
+                        await Task.Delay(1200);
+                        restoredLayout = true;
+                    }
+                    else
+                    {
+                        _log.Write($"Auto-restore skipped for layout profile '{profile}' because CCD and MultiMonitorTool restore both failed.");
+                    }
                 }
                 else
                 {
-                    _log.Write($"Auto-restored layout profile '{profile}' after all monitors became active.");
-                    await Task.Delay(800);
-                    await ApplySavedLayoutTopologyWithRetryAsync(profile, path);
-                    restoredLayout = true;
+                    _log.Write($"Auto-restore skipped for layout profile '{profile}' because the layout file was not found: {path}.");
                 }
 
                 RefreshMonitorsAndUi();
@@ -1952,6 +1963,14 @@ namespace WorkMonitorSwitcher
 
         private void SetPrimaryWithTopologyFallback(string target, string reason)
         {
+            var currentPrimary = Screen.PrimaryScreen?.DeviceName;
+            if (!string.IsNullOrWhiteSpace(currentPrimary) &&
+                MonitorTargetResolver.TargetsEquivalent(currentPrimary, target))
+            {
+                _log.Write($"Skipped set primary ({reason}); '{currentPrimary}' is already primary.");
+                return;
+            }
+
             var result = _topologySvc.SetPrimaryDisplay(target);
             LogTopologyResult($"CCD set primary ({reason})", result);
             if (!result.Success)

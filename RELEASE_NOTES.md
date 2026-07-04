@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.3.8 - 2026-07-04
+
+### Fixed
+
+- Reduced redundant display topology changes during monitor enable and saved-layout restore to avoid destabilising Wallpaper Engine.
+- Skipped no-op primary-monitor applies when the preferred primary is already active.
+
 ## v0.3.7 - 2026-07-03
 
 ### Added

@@ -283,6 +283,16 @@ namespace WorkMonitorSwitcher.Services
                 })
                 .ToList();
 
+            if (IsTopologyAlreadyApplied(snapshot.Entries.Count, orderedEntries, positions, sizes, rotations))
+            {
+                return new DisplayTopologyResult
+                {
+                    Success = true,
+                    Message = $"{successMessage} No display topology change was required.",
+                    Details = details
+                };
+            }
+
             var validateCode = SetDisplayConfig(
                 (uint)paths.Length,
                 paths,
@@ -318,6 +328,64 @@ namespace WorkMonitorSwitcher.Services
                 Details = details
             };
         }
+
+        private static bool IsTopologyAlreadyApplied(
+            int activePathCount,
+            IReadOnlyList<PathEntry> orderedEntries,
+            IReadOnlyDictionary<int, DisplayPosition> positions,
+            IReadOnlyDictionary<int, DisplaySize>? sizes,
+            IReadOnlyDictionary<int, uint>? rotations)
+        {
+            if (orderedEntries.Count != activePathCount)
+                return false;
+
+            if (orderedEntries.Count == 0)
+                return true;
+
+            foreach (var entry in orderedEntries)
+            {
+                if (!positions.TryGetValue(entry.SourceModeIndex, out var position))
+                    return false;
+
+                if (entry.X != position.X || entry.Y != position.Y)
+                    return false;
+
+                var intendedRotation = rotations != null &&
+                                       rotations.TryGetValue(entry.SourceModeIndex, out var rotation)
+                    ? rotation
+                    : entry.Rotation;
+
+                if (rotations != null &&
+                    rotations.TryGetValue(entry.SourceModeIndex, out var expectedRotation) &&
+                    entry.Rotation != expectedRotation)
+                {
+                    return false;
+                }
+
+                if (sizes != null &&
+                    sizes.TryGetValue(entry.SourceModeIndex, out var size) &&
+                    !DisplaySizeMatches(entry, size, intendedRotation))
+                {
+                    return false;
+                }
+            }
+
+            var primary = orderedEntries[0];
+            return primary.X == 0 && primary.Y == 0;
+        }
+
+        private static bool DisplaySizeMatches(PathEntry entry, DisplaySize size, uint rotation)
+        {
+            if (entry.Width == size.Width && entry.Height == size.Height)
+                return true;
+
+            return IsQuarterTurn(rotation) &&
+                   entry.Width == size.Height &&
+                   entry.Height == size.Width;
+        }
+
+        private static bool IsQuarterTurn(uint rotation)
+            => rotation == 2 || rotation == 4;
 
         private static TopologySnapshot QueryActiveTopology()
         {
