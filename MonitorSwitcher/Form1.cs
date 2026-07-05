@@ -85,6 +85,7 @@ namespace WorkMonitorSwitcher
         private bool _isRefreshingUi;
         private bool _refreshAgainAfterCurrent;
         private System.Windows.Forms.Timer? _restoreRefreshTimer;
+        private System.Windows.Forms.Timer? _startupRestoreTimer;
         private EventWaitHandle? _showExistingWindowEvent;
         private RegisteredWaitHandle? _showExistingWindowWait;
 
@@ -264,6 +265,8 @@ namespace WorkMonitorSwitcher
                     RefreshMonitorsAndUi();
                     LeftTopButtons();
                 }
+
+                QueueStartupLayoutRestore();
             }));
         }
 
@@ -292,6 +295,8 @@ namespace WorkMonitorSwitcher
             _showExistingWindowEvent?.Dispose();
             _restoreRefreshTimer?.Stop();
             _restoreRefreshTimer?.Dispose();
+            _startupRestoreTimer?.Stop();
+            _startupRestoreTimer?.Dispose();
             _trayIcon?.Dispose();
             _trayMenu?.Dispose();
             base.OnFormClosed(e);
@@ -660,6 +665,49 @@ namespace WorkMonitorSwitcher
         private string SelectedLayoutPath()
             => _profileStore.GetLayoutPath(SelectedLayoutProfileName());
 
+        private void QueueStartupLayoutRestore()
+        {
+            if (!_uiSettings.RestoreLayoutOnStartup)
+                return;
+
+            if (_startupRestoreTimer != null)
+                return;
+
+            _startupRestoreTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+            _startupRestoreTimer.Tick += async (_, __) =>
+            {
+                _startupRestoreTimer?.Stop();
+                _startupRestoreTimer?.Dispose();
+                _startupRestoreTimer = null;
+
+                await RestoreLayoutOnStartupAsync();
+            };
+            _startupRestoreTimer.Start();
+        }
+
+        private async Task RestoreLayoutOnStartupAsync()
+        {
+            if (!_uiSettings.RestoreLayoutOnStartup)
+                return;
+
+            var profile = SelectedLayoutProfileName();
+            var path = SelectedLayoutPath();
+            if (!File.Exists(path))
+            {
+                _log.Write($"Skipped startup layout restore for profile '{profile}' because the layout file was not found: {path}.");
+                return;
+            }
+
+            if (_displayActionGate.CurrentCount == 0)
+            {
+                _log.Write($"Skipped startup layout restore for profile '{profile}' because another display action is already running.");
+                return;
+            }
+
+            _log.Write($"Startup layout restore requested for profile '{profile}' at {path}.");
+            await RestoreSelectedLayoutProfileAsync(showMessage: false);
+        }
+
         private void SaveSelectedLayoutProfile()
         {
             if (_displayActionGate.CurrentCount == 0)
@@ -838,7 +886,7 @@ namespace WorkMonitorSwitcher
 
         private async Task RestoreSelectedLayoutProfileAsync(bool showMessage)
         {
-            if (!TryBeginDisplayAction("restore layout"))
+            if (!TryBeginDisplayAction("restore layout", showMessage))
                 return;
 
             try
@@ -982,6 +1030,7 @@ namespace WorkMonitorSwitcher
                 _uiSettings.StartWithWindows,
                 _uiSettings.ConfirmBeforeDisable,
                 _uiSettings.AutoSaveLayoutBeforeDisable,
+                _uiSettings.RestoreLayoutOnStartup,
                 Path.Combine(AppContext.BaseDirectory, "MultiMonitorTool.cfg"),
                 _profileStore.LoadProfileNames(),
                 SelectedLayoutProfileName(),
@@ -1072,6 +1121,9 @@ namespace WorkMonitorSwitcher
                 if (dlg.AutoSaveLayoutBeforeDisableResult.HasValue)
                     _uiSettings.AutoSaveLayoutBeforeDisable = dlg.AutoSaveLayoutBeforeDisableResult.Value;
 
+                if (dlg.RestoreLayoutOnStartupResult.HasValue)
+                    _uiSettings.RestoreLayoutOnStartup = dlg.RestoreLayoutOnStartupResult.Value;
+
                 if (!string.IsNullOrWhiteSpace(dlg.SelectedLayoutProfileResult))
                     _uiSettings.SelectedLayoutProfile = dlg.SelectedLayoutProfileResult;
 
@@ -1093,7 +1145,7 @@ namespace WorkMonitorSwitcher
             }
         }
 
-        private bool TryBeginDisplayAction(string actionName)
+        private bool TryBeginDisplayAction(string actionName, bool showBusyMessage = true)
         {
             if (_displayActionGate.Wait(0))
             {
@@ -1101,9 +1153,14 @@ namespace WorkMonitorSwitcher
                 return true;
             }
 
-            ThemedMessageBox.Info(this,
-                "Another monitor action is already running. Wait for it to finish, then try again.",
-                "Monitor Switcher", _uiSettings.DarkMode);
+            if (showBusyMessage)
+            {
+                ThemedMessageBox.Info(this,
+                    "Another monitor action is already running. Wait for it to finish, then try again.",
+                    "Monitor Switcher", _uiSettings.DarkMode);
+            }
+
+            _log.Write($"Display action skipped: {actionName}; another monitor action is already running.");
             return false;
         }
 

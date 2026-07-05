@@ -512,6 +512,8 @@ static void UiSettingsDisablesAutomaticLayoutSavesByDefault()
 
     AssertFalse(settings.AutoSaveLayoutBeforeDisable,
         "Expected automatic layout saves before disable to be off by default.");
+    AssertFalse(settings.RestoreLayoutOnStartup,
+        "Expected startup layout restore to be off by default.");
 }
 
 static void Form1BuildsUniqueAutomaticLayoutBackupPaths()

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.3.9 - 2026-07-06
+
+### Added
+
+- Added an optional startup layout restore setting so Monitor Switcher can reapply the selected layout profile shortly after sign-in.
+
 ## v0.3.8 - 2026-07-04
 
 ### Fixed

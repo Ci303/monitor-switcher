@@ -49,7 +49,7 @@ Settings includes:
 - Editable monitor aliases.
 - Preferred primary monitor selection.
 - Dark mode and always-on-top toggles.
-- Minimize-to-tray, start-with-Windows, and confirm-before-disable options.
+- Minimize-to-tray, start-with-Windows, restore-layout-on-app-start, and confirm-before-disable options.
 - **Edit cfg** for `MultiMonitorTool.cfg`.
 - **Open Registry** or double-clicking a registry-key cell to open Regedit at that monitor key. The grid shows a shortened class path, while tooltips/details and copy actions keep the full registry key.
 - **Download MultiMonitorTool** for the NirSoft helper executable.
@@ -62,6 +62,8 @@ Settings includes:
 Press **Save** to enter a layout profile name and capture the current monitor arrangement. Profile names are sanitized for safe file storage. Press **Restore** to load the currently selected profile. The active layout profile can be changed in Settings.
 
 The app still auto-restores the selected layout profile after all saved monitors become active again.
+
+If Windows or the graphics driver boots into the wrong rotation or position, enable both **Start with Windows** and **Restore layout on app start** in Settings. Monitor Switcher will then apply the selected layout profile shortly after sign-in.
 
 ## Running Locally
 
